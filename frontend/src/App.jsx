@@ -2,7 +2,6 @@ import React, { useState } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import LoginPage from './pages/LoginPage';
 import ChatPage from './pages/ChatPage';
-import './App.css';
 
 function App() {
   // We'll store the teamId in the App component to share it between pages.
@@ -21,7 +20,7 @@ function App() {
 
   return (
     <Router>
-      <div className="app-container">
+      <div className="w-full h-screen bg-slate-100">
         <Routes>
           <Route 
             path="/login" 
