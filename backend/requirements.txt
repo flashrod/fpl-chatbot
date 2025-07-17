@@ -3,4 +3,3 @@ uvicorn[standard]
 python-dotenv
 google-generativeai
 httpx
-python-cors
