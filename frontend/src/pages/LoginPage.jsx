@@ -18,8 +18,14 @@ const LoginPage = ({ onLogin }) => {
     try {
       const response = await fetch(`http://127.0.0.1:8000/api/get-team-data/${inputId}`);
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Team ID not found. Please check and try again.');
+        // Try to parse the error message from the backend
+        try {
+            const errorData = await response.json();
+            throw new Error(errorData.detail || 'Team ID not found. Please check the ID and try again.');
+        } catch {
+            // Fallback if the error response isn't JSON
+            throw new Error(`Error: ${response.status} ${response.statusText}`);
+        }
       }
       onLogin(inputId);
     } catch (err) {
@@ -55,7 +61,7 @@ const LoginPage = ({ onLogin }) => {
           </button>
         </form>
 
-        {error && <p className="text-red-500 mt-4">{error}</p>}
+        {error && <p className="text-red-500 mt-4 text-sm">{error}</p>}
 
         <div className="text-left mt-8 p-4 bg-slate-800/50 border border-slate-700 rounded-lg">
           <p className="text-sm text-slate-400">

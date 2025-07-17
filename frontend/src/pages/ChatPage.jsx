@@ -8,7 +8,7 @@ const ChatPage = ({ teamId, onLogout }) => {
 
   useEffect(() => {
     setMessages([
-      { sender: 'bot', text: `Hi! I'm ready to help with your FPL team (ID: ${teamId}). Ask me anything about your squad.` }
+      { sender: 'bot', text: `Hi! I'm ready to help with your FPL team (ID: ${teamId}). Ask me anything about your squad.`, error: false }
     ]);
   }, [teamId]);
 
@@ -21,7 +21,7 @@ const ChatPage = ({ teamId, onLogout }) => {
     if (!input.trim() || isLoading) return;
 
     const userMessage = { sender: 'user', text: input };
-    setMessages(prev => [...prev, userMessage, { sender: 'bot', text: '' }]);
+    setMessages(prev => [...prev, userMessage, { sender: 'bot', text: '', error: false }]);
     const currentInput = input;
     setInput('');
     setIsLoading(true);
@@ -37,7 +37,7 @@ const ChatPage = ({ teamId, onLogout }) => {
       });
 
       if (!response.ok || !response.body) {
-          throw new Error('Failed to get a response from the server.');
+          throw new Error('Failed to get a valid response from the server.');
       }
 
       const reader = response.body.getReader();
@@ -47,7 +47,7 @@ const ChatPage = ({ teamId, onLogout }) => {
         const { value, done } = await reader.read();
         if (done) break;
         
-        const chunk = decoder.decode(value);
+        const chunk = decoder.decode(value, { stream: true });
         setMessages(prev => {
           const newMessages = [...prev];
           newMessages[newMessages.length - 1].text += chunk;
@@ -59,7 +59,11 @@ const ChatPage = ({ teamId, onLogout }) => {
       console.error("Streaming Error:", error);
       setMessages(prev => {
          const newMessages = [...prev];
-         newMessages[newMessages.length - 1].text = 'Sorry, I had a problem thinking. Please try again.';
+         const lastMessage = newMessages[newMessages.length - 1];
+         if (lastMessage && lastMessage.sender === 'bot') {
+            lastMessage.text = 'Sorry, I had a problem thinking. Please try again.';
+            lastMessage.error = true; // Mark this message as an error
+         }
          return newMessages;
       });
     } finally {
@@ -84,15 +88,17 @@ const ChatPage = ({ teamId, onLogout }) => {
               className={`flex items-end gap-2 ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}
             >
               <div
-                className={`max-w-xs md:max-w-md lg:max-w-lg p-3 rounded-2xl ${
+                className={`max-w-xs md:max-w-md lg:max-w-lg p-3 rounded-2xl transition-colors ${
                   msg.sender === 'user'
                     ? 'bg-green-500 text-black rounded-br-none'
-                    : 'bg-slate-200 text-slate-800 rounded-bl-none'
+                    : msg.error
+                    ? 'bg-red-500 text-white rounded-bl-none' // Error style
+                    : 'bg-slate-200 text-slate-800 rounded-bl-none' // Normal bot style
                 }`}
               >
                 <p className="text-sm" style={{ whiteSpace: 'pre-wrap' }}>
                   {msg.text}
-                  {isLoading && index === messages.length - 1 && <span className="animate-pulse">...</span>}
+                  {isLoading && index === messages.length - 1 && !msg.text && <span className="animate-pulse">...</span>}
                 </p>
               </div>
             </div>
