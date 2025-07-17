@@ -49,7 +49,6 @@ def load_data_and_models():
     """Load all necessary data and models into memory when the app starts."""
     global historical_data_store, vector_index, embedding_model, player_id_map
     if PROCESSED_DATA_PATH.exists():
-        print("Loading historical player data...")
         with open(PROCESSED_DATA_PATH, 'r', encoding='utf-8') as f:
             historical_data_store = json.load(f)
         player_id_map = {i: name for i, name in enumerate(historical_data_store.keys())}
@@ -62,7 +61,6 @@ def load_data_and_models():
     print("✅ Embedding model loaded.")
 
     if FAISS_INDEX_PATH.exists():
-        print("Loading FAISS vector index...")
         vector_index = faiss.read_index(str(FAISS_INDEX_PATH))
         print("✅ FAISS index loaded.")
     else:
@@ -93,7 +91,6 @@ class TeamData(BaseModel):
 
 async def get_live_fpl_data():
     if 'live_data' in fpl_live_data_cache:
-        print("CACHE HIT: Returning cached live FPL data.")
         return fpl_live_data_cache['live_data']
     
     print("CACHE MISS: Fetching new live data from FPL API.")
@@ -122,7 +119,7 @@ async def get_live_fpl_data():
 
         live_data = {
             "bootstrap": bootstrap_data,
-            "all_fixtures": fixtures_data, # Add all fixtures for chip calculator
+            "all_fixtures": fixtures_data,
             "player_details": player_details,
             "upcoming_fixtures": upcoming_fixtures
         }
@@ -162,10 +159,13 @@ async def get_team_data(team_id: int):
 # --- API Endpoints ---
 @app.get("/api/chip-recommendations")
 async def get_chip_recommendations():
-    """Endpoint to get chip usage recommendations."""
     live_data = await get_live_fpl_data()
-    recommendations = await chip_service.calculate_chip_recommendations(live_data)
-    return recommendations
+    return await chip_service.calculate_chip_recommendations(live_data)
+
+@app.get("/api/player-recommendations")
+async def get_player_recommendations(position: int = None):
+    live_data = await get_live_fpl_data()
+    return chip_service.get_recommended_players(live_data, position_filter=position, limit=10)
 
 async def stream_chat_response(request: ChatRequest):
     try:
@@ -174,10 +174,9 @@ async def stream_chat_response(request: ChatRequest):
 
         context_players = set()
         if vector_index and embedding_model:
-            print("Performing RAG search...")
             question_embedding = embedding_model.encode([request.question])
             k = 3
-            distances, indices = vector_index.search(question_embedding, k)
+            _, indices = vector_index.search(question_embedding, k)
             for i in indices[0]:
                 if i != -1:
                     player_name = player_id_map.get(i)
@@ -201,7 +200,7 @@ async def stream_chat_response(request: ChatRequest):
                         if team_name:
                             context_block += (f"* **Live Status:** Form: {details.get('form', 'N/A')}, "
                                               f"Injury: {details.get('news', 'Available') or 'Available'}\n")
-                            context_block += f"* **Upcoming Fixtures:** {', '.join(live_data['upcoming_fixtures'].get(team_name, ['N/A']))}\n"
+                            context_block += f"* **Upcoming Fixtures for {team_name}:** {', '.join(live_data['upcoming_fixtures'].get(team_name, ['N/A']))}\n"
                 if name in historical_data_store:
                     context_block += f"* **Historical Note:** {json.dumps(historical_data_store[name])}\n"
             context_block += "-----------------------\n"
