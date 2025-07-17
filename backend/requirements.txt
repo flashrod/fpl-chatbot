@@ -5,3 +5,5 @@ google-generativeai
 httpx
 cachetools
 pandas
+sentence-transformers
+faiss-cpu
