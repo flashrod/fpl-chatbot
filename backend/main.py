@@ -126,7 +126,12 @@ async def get_live_fpl_data():
         fpl_live_data_cache['live_data'] = live_data
         return live_data
 
+@app.get("/api/get-team-data/{team_id}", response_model=TeamData)
 async def get_team_data(team_id: int):
+    """
+    Fetches the user's FPL team data. It now handles the pre-season case
+    where player picks for GW1 might not be available yet.
+    """
     try:
         live_data = await get_live_fpl_data()
         bootstrap_data = live_data['bootstrap']
@@ -139,8 +144,16 @@ async def get_team_data(team_id: int):
         
         players = []
         async with httpx.AsyncClient() as client:
+            # First, check if the team entry exists to validate the ID
+            entry_res = await client.get(f"https://fantasy.premierleague.com/api/entry/{team_id}/")
+            if entry_res.status_code != 200:
+                raise HTTPException(status_code=404, detail=f"FPL Team ID {team_id} not found.")
+
+            # Now, try to get the picks
             picks_res = await client.get(team_picks_url)
             
+            # If picks are found (200 OK), process them.
+            # If not found (404), just continue with an empty player list, which is fine for pre-season.
             if picks_res.status_code == 200:
                 picks_data = picks_res.json()
                 for pick in picks_data.get('picks', []):
@@ -153,8 +166,15 @@ async def get_team_data(team_id: int):
                         players.append(Player(name=player_details['name'], position=position, cost=player_details['cost']))
 
         return TeamData(team_id=team_id, gameweek=current_gameweek, players=players)
+
+    except HTTPException as http_exc:
+        # Re-raise HTTP exceptions to be handled by FastAPI
+        raise http_exc
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Catch any other unexpected errors
+        print(f"Error in get_team_data: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected server error occurred.")
+
 
 # --- API Endpoints ---
 @app.get("/api/chip-recommendations")

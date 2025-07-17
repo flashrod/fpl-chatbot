@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import ReactMarkdown from 'react-markdown'; // Import the markdown renderer
-import remarkGfm from 'remark-gfm'; // Import the GFM plugin
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
-const ChatPage = ({ teamId, onLogout }) => {
+const ChatPage = ({ teamId }) => { // Removed onLogout as it's handled by the layout now
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -44,7 +44,7 @@ const ChatPage = ({ teamId, onLogout }) => {
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      let lastChunk = ''; // --- FIX: Keep track of the last chunk ---
+      let lastChunk = '';
 
       while (true) {
         const { value, done } = await reader.read();
@@ -52,7 +52,6 @@ const ChatPage = ({ teamId, onLogout }) => {
         
         const chunk = decoder.decode(value, { stream: true });
 
-        // --- FIX: Check for and prevent duplicate chunks ---
         if (chunk !== lastChunk) {
             setMessages(prev => {
               const newMessages = [...prev];
@@ -81,13 +80,6 @@ const ChatPage = ({ teamId, onLogout }) => {
 
   return (
     <div className="bg-white w-full h-full flex flex-col">
-      <header className="flex justify-between items-center p-4 bg-slate-900 text-white shadow-md">
-        <h2 className="text-xl font-bold">FPL AI Chat</h2>
-        <button onClick={onLogout} className="bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 px-4 rounded-lg transition-colors text-sm">
-          Change Team
-        </button>
-      </header>
-
       <main className="flex-1 overflow-y-auto p-4 bg-slate-100">
         <div className="flex flex-col space-y-4" ref={messagesEndRef}>
           {messages.map((msg, index) => (
