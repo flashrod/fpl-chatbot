@@ -16,6 +16,9 @@ from dotenv import load_dotenv
 from cachetools import TTLCache
 from fastapi.responses import StreamingResponse
 
+# Import the new chip service
+import chip_service
+
 # --- Configuration ---
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -32,7 +35,7 @@ PROCESSED_DATA_PATH = DATA_DIR / "processed_player_data.json"
 FAISS_INDEX_PATH = DATA_DIR / "player_data.index"
 
 # --- In-Memory Stores ---
-fpl_live_data_cache = TTLCache(maxsize=1, ttl=3600) # Cache live data for 1 hour
+fpl_live_data_cache = TTLCache(maxsize=1, ttl=3600)
 historical_data_store = {}
 vector_index = None
 embedding_model = None
@@ -89,9 +92,6 @@ class TeamData(BaseModel):
 # --- Helper Functions ---
 
 async def get_live_fpl_data():
-    """
-    Gets live FPL data (bootstrap, fixtures, injuries) using a cache.
-    """
     if 'live_data' in fpl_live_data_cache:
         print("CACHE HIT: Returning cached live FPL data.")
         return fpl_live_data_cache['live_data']
@@ -102,23 +102,12 @@ async def get_live_fpl_data():
         fixtures_task = client.get(FPL_API_FIXTURES)
         bootstrap_res, fixtures_res = await asyncio.gather(bootstrap_task, fixtures_task)
         
-        bootstrap_res.raise_for_status()
-        fixtures_res.raise_for_status()
-        
         bootstrap_data = bootstrap_res.json()
         fixtures_data = fixtures_res.json()
 
         teams_map = {team['id']: team['short_name'] for team in bootstrap_data['teams']}
         
-        player_details = {}
-        for p in bootstrap_data['elements']:
-            player_details[p['id']] = {
-                'name': p['web_name'],
-                'team_id': p['team'],
-                'status': p['status'],
-                'news': p['news'],
-                'form': p['form']
-            }
+        player_details = {p['id']: {'name': p['web_name'], 'team_id': p['team'], 'status': p['status'], 'news': p['news'], 'form': p['form']} for p in bootstrap_data['elements']}
         
         upcoming_fixtures = {}
         current_gameweek = next((gw['id'] for gw in bootstrap_data['events'] if gw['is_current']), None)
@@ -133,6 +122,7 @@ async def get_live_fpl_data():
 
         live_data = {
             "bootstrap": bootstrap_data,
+            "all_fixtures": fixtures_data, # Add all fixtures for chip calculator
             "player_details": player_details,
             "upcoming_fixtures": upcoming_fixtures
         }
@@ -169,13 +159,19 @@ async def get_team_data(team_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- RAG-Powered Chat Stream ---
+# --- API Endpoints ---
+@app.get("/api/chip-recommendations")
+async def get_chip_recommendations():
+    """Endpoint to get chip usage recommendations."""
+    live_data = await get_live_fpl_data()
+    recommendations = await chip_service.calculate_chip_recommendations(live_data)
+    return recommendations
+
 async def stream_chat_response(request: ChatRequest):
     try:
         team_data = await get_team_data(request.team_id)
         live_data = await get_live_fpl_data()
 
-        # RAG Search for relevant players
         context_players = set()
         if vector_index and embedding_model:
             print("Performing RAG search...")
@@ -191,11 +187,10 @@ async def stream_chat_response(request: ChatRequest):
         for player in team_data.players:
             context_players.add(player.name)
 
-        # Build the context string
         context_block = ""
         if context_players:
             context_block += "\n\n--- CONTEXTUAL DATA ---\n"
-            for name in context_players:
+            for name in sorted(list(context_players)):
                 context_block += f"Player: **{name}**\n"
                 player_id = next((pid for pid, pdata in live_data['player_details'].items() if pdata['name'] == name), None)
                 if player_id:
@@ -210,9 +205,7 @@ async def stream_chat_response(request: ChatRequest):
                 if name in historical_data_store:
                     context_block += f"* **Historical Note:** {json.dumps(historical_data_store[name])}\n"
             context_block += "-----------------------\n"
-            print(f"Retrieved context for: {', '.join(context_players)}")
 
-        # --- FINAL, IMPROVED PROMPT ---
         prompt = f"""
         You are "FPL AI", a world-class Fantasy Premier League analyst. Your tone is insightful, data-driven, and slightly witty.
         Your task is to answer the user's question based on all the data provided.
