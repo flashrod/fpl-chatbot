@@ -111,9 +111,9 @@ async def get_live_fpl_data():
         if current_gameweek:
             for team_id_num in teams_map:
                 team_fixtures = [
-                    f"{teams_map[f['team_a']]} (A) [{f['team_a_difficulty']}]" if f['team_h'] != team_id_num else f"{teams_map[f['team_h']]} (H) [{f['team_h_difficulty']}]"
+                    f"{teams_map.get(f['team_a'])} (A) [{f.get('team_a_difficulty', 3)}]" if f.get('team_h') != team_id_num else f"{teams_map.get(f['team_h'])} (H) [{f.get('team_h_difficulty', 3)}]"
                     for f in fixtures_data 
-                    if f.get('event') and (f['team_h'] == team_id_num or f['team_a'] == team_id_num) and f['event'] >= current_gameweek
+                    if f.get('event') and f.get('team_h') and f.get('team_a') and (f['team_h'] == team_id_num or f['team_a'] == team_id_num) and f['event'] >= current_gameweek
                 ]
                 upcoming_fixtures[teams_map[team_id_num]] = team_fixtures[:3]
 

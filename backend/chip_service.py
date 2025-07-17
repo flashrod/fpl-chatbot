@@ -14,10 +14,12 @@ def identify_double_gameweeks(fixtures: List[Dict], current_gw: int) -> Dict[int
         if gw not in team_fixtures_by_gw:
             team_fixtures_by_gw[gw] = {}
         
-        home_team, away_team = f["team_h"], f["team_a"]
-        team_fixtures_by_gw[gw][home_team] = team_fixtures_by_gw[gw].get(home_team, 0) + 1
-        team_fixtures_by_gw[gw][away_team] = team_fixtures_by_gw[gw].get(away_team, 0) + 1
-        
+        home_team, away_team = f.get("team_h"), f.get("team_a")
+        if home_team:
+            team_fixtures_by_gw[gw][home_team] = team_fixtures_by_gw[gw].get(home_team, 0) + 1
+        if away_team:
+            team_fixtures_by_gw[gw][away_team] = team_fixtures_by_gw[gw].get(away_team, 0) + 1
+            
     return team_fixtures_by_gw
 
 def calculate_gameweek_difficulty(gw: int, team_fixtures_in_gw: Dict[int, int], all_fixtures: List[Dict], teams_map: Dict[int, Any]) -> Dict:
@@ -28,19 +30,22 @@ def calculate_gameweek_difficulty(gw: int, team_fixtures_in_gw: Dict[int, int], 
     
     team_difficulties = {}
     for fixture in gw_fixtures:
-        home_team, away_team = fixture["team_h"], fixture["team_a"]
+        home_team, away_team = fixture.get("team_h"), fixture.get("team_a")
         
-        if away_team not in team_difficulties: team_difficulties[away_team] = []
-        team_difficulties[away_team].append(fixture["team_h_difficulty"])
+        if away_team:
+            if away_team not in team_difficulties: team_difficulties[away_team] = []
+            team_difficulties[away_team].append(fixture.get("team_h_difficulty", 3))
         
-        if home_team not in team_difficulties: team_difficulties[home_team] = []
-        team_difficulties[home_team].append(fixture["team_a_difficulty"])
+        if home_team:
+            if home_team not in team_difficulties: team_difficulties[home_team] = []
+            team_difficulties[home_team].append(fixture.get("team_a_difficulty", 3))
 
-    team_avg_difficulty = {tid: sum(d) / len(d) for tid, d in team_difficulties.items()}
+    team_avg_difficulty = {tid: sum(d) / len(d) for tid, d in team_difficulties.items() if d}
     
     double_gw_teams = {tid: count for tid, count in team_fixtures_in_gw.items() if count > 1}
     avg_difficulty = sum(team_avg_difficulty.values()) / len(team_avg_difficulty) if team_avg_difficulty else 3
     
+    # A simple scoring model: lower is better. Penalize high difficulty, reward double gameweeks.
     difficulty_score = (avg_difficulty * 0.3) - (len(double_gw_teams) * 5)
     
     return {
@@ -50,21 +55,21 @@ def calculate_gameweek_difficulty(gw: int, team_fixtures_in_gw: Dict[int, int], 
         "avg_fixture_difficulty": round(avg_difficulty, 2),
     }
 
-def get_recommended_players(live_data: Dict[str, Any], position_filter: int = None, limit: int = 5) -> List[Dict]:
+def get_recommended_players(live_data: Dict[str, Any], position_filter: int = None, limit: int = 10) -> List[Dict]:
     """
     Gets player recommendations based on form, fixture difficulty, and total points.
     """
     players = live_data["bootstrap"]["elements"]
     if position_filter:
-        players = [p for p in players if p["element_type"] == position_filter]
+        players = [p for p in players if p.get("element_type") == position_filter]
 
     position_map = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
     teams_map = {team['id']: team for team in live_data["bootstrap"]["teams"]}
 
     player_scores = []
     for player in players:
-        team_id = player["team"]
-        form = float(player.get("form", 0))
+        team_id = player.get("team")
+        form = float(player.get("form", 0.0))
         points = player.get("total_points", 0)
         minutes = player.get("minutes", 0)
         
@@ -75,12 +80,15 @@ def get_recommended_players(live_data: Dict[str, Any], position_filter: int = No
         if not team_info:
             continue
             
-        team_short_name = team_info['short_name']
-        upcoming_fixtures_text = live_data['upcoming_fixtures'].get(team_short_name, [])
+        team_short_name = team_info.get('short_name')
+        if not team_short_name:
+            continue
+        
+        upcoming_fixtures_text = live_data.get('upcoming_fixtures', {}).get(team_short_name, [])
         
         # A simple heuristic for fixture difficulty from the text
         try:
-            avg_difficulty = sum([int(f.split('[')[1].split(']')[0]) for f in upcoming_fixtures_text]) / len(upcoming_fixtures_text)
+            avg_difficulty = sum([int(f.split('[')[1].split(']')[0]) for f in upcoming_fixtures_text]) / len(upcoming_fixtures_text) if upcoming_fixtures_text else 3
         except (IndexError, ValueError):
             avg_difficulty = 3 # Default difficulty
 
@@ -91,14 +99,13 @@ def get_recommended_players(live_data: Dict[str, Any], position_filter: int = No
             "name": player["web_name"],
             "team": team_info["name"],
             "position": position_map.get(player["element_type"]),
-            "price": player["now_cost"] / 10.0,
+            "price": player.get("now_cost", 0) / 10.0,
             "form": form,
             "points": points,
             "score": round(score, 2)
         })
 
     return sorted(player_scores, key=lambda x: x["score"], reverse=True)[:limit]
-
 
 async def calculate_chip_recommendations(live_data: Dict[str, Any], number_of_recommendations: int = 3) -> Dict:
     """
