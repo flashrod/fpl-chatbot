@@ -74,14 +74,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# (Pydantic Models remain the same)
+# --- Pydantic Models ---
 class ChatRequest(BaseModel):
     team_id: int
     question: str
+
 class Player(BaseModel):
     name: str
     position: str
     cost: float
+    team_name: str
+    team_shirt_color: str
+    team_shirt_sleeve_color: str
+
 class TeamData(BaseModel):
     team_id: int
     gameweek: int
@@ -102,7 +107,7 @@ async def get_live_fpl_data():
         bootstrap_data = bootstrap_res.json()
         fixtures_data = fixtures_res.json()
 
-        teams_map = {team['id']: team['short_name'] for team in bootstrap_data['teams']}
+        teams_map = {team['id']: team for team in bootstrap_data['teams']}
         
         player_details = {p['id']: {'name': p['web_name'], 'team_id': p['team'], 'status': p['status'], 'news': p['news'], 'form': p['form']} for p in bootstrap_data['elements']}
         
@@ -111,11 +116,11 @@ async def get_live_fpl_data():
         if current_gameweek:
             for team_id_num in teams_map:
                 team_fixtures = [
-                    f"{teams_map.get(f['team_a'])} (A) [{f.get('team_a_difficulty', 3)}]" if f.get('team_h') != team_id_num else f"{teams_map.get(f['team_h'])} (H) [{f.get('team_h_difficulty', 3)}]"
+                    f"{teams_map[f['team_a']]['short_name']} (A) [{f.get('team_a_difficulty', 3)}]" if f.get('team_h') != team_id_num else f"{teams_map[f['team_h']]['short_name']} (H) [{f.get('team_h_difficulty', 3)}]"
                     for f in fixtures_data 
                     if f.get('event') and f.get('team_h') and f.get('team_a') and (f['team_h'] == team_id_num or f['team_a'] == team_id_num) and f['event'] >= current_gameweek
                 ]
-                upcoming_fixtures[teams_map[team_id_num]] = team_fixtures[:3]
+                upcoming_fixtures[teams_map[team_id_num]['short_name']] = team_fixtures[:3]
 
         live_data = {
             "bootstrap": bootstrap_data,
@@ -129,49 +134,48 @@ async def get_live_fpl_data():
 @app.get("/api/get-team-data/{team_id}", response_model=TeamData)
 async def get_team_data(team_id: int):
     """
-    Fetches the user's FPL team data. It now handles the pre-season case
-    where player picks for GW1 might not be available yet.
+    Fetches the user's FPL team data, including team colors for the UI.
     """
     try:
         live_data = await get_live_fpl_data()
         bootstrap_data = live_data['bootstrap']
         
         current_gameweek = next((gw['id'] for gw in bootstrap_data['events'] if gw['is_current']), 1)
-        player_map = {p['id']: {'name': p['web_name'], 'cost': p['now_cost'] / 10} for p in bootstrap_data['elements']}
+        
+        player_map = {p['id']: p for p in bootstrap_data['elements']}
         position_map = {p_type['id']: p_type['singular_name_short'] for p_type in bootstrap_data['element_types']}
+        teams_map = {t['id']: t for t in bootstrap_data['teams']}
         
         team_picks_url = FPL_API_TEAM_PICKS.format(team_id=team_id, gameweek=current_gameweek)
         
         players = []
         async with httpx.AsyncClient() as client:
-            # First, check if the team entry exists to validate the ID
             entry_res = await client.get(f"https://fantasy.premierleague.com/api/entry/{team_id}/")
             if entry_res.status_code != 200:
                 raise HTTPException(status_code=404, detail=f"FPL Team ID {team_id} not found.")
 
-            # Now, try to get the picks
             picks_res = await client.get(team_picks_url)
             
-            # If picks are found (200 OK), process them.
-            # If not found (404), just continue with an empty player list, which is fine for pre-season.
             if picks_res.status_code == 200:
                 picks_data = picks_res.json()
                 for pick in picks_data.get('picks', []):
-                    player_id = pick['element']
-                    player_details = player_map.get(player_id)
-                    player_type_id = next((p['element_type'] for p in bootstrap_data['elements'] if p['id'] == player_id), None)
-                    position = position_map.get(player_type_id, 'N/A')
-
-                    if player_details:
-                        players.append(Player(name=player_details['name'], position=position, cost=player_details['cost']))
+                    player_info = player_map.get(pick['element'])
+                    if player_info:
+                        team_info = teams_map.get(player_info['team'])
+                        players.append(Player(
+                            name=player_info['web_name'],
+                            position=position_map.get(player_info['element_type']),
+                            cost=player_info['now_cost'] / 10.0,
+                            team_name=team_info['short_name'] if team_info else 'N/A',
+                            team_shirt_color=team_info.get('team_shirt_colour', '#ffffff'),
+                            team_shirt_sleeve_color=team_info.get('team_shirt_sleeve_colour', '#000000')
+                        ))
 
         return TeamData(team_id=team_id, gameweek=current_gameweek, players=players)
 
     except HTTPException as http_exc:
-        # Re-raise HTTP exceptions to be handled by FastAPI
         raise http_exc
     except Exception as e:
-        # Catch any other unexpected errors
         print(f"Error in get_team_data: {e}")
         raise HTTPException(status_code=500, detail="An unexpected server error occurred.")
 
