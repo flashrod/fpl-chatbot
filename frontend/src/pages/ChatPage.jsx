@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
+import ReactMarkdown from 'react-markdown'; // Import the markdown renderer
+import remarkGfm from 'remark-gfm'; // Import the GFM plugin
 
 const ChatPage = ({ teamId, onLogout }) => {
   const [messages, setMessages] = useState([]);
@@ -42,17 +44,23 @@ const ChatPage = ({ teamId, onLogout }) => {
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
+      let lastChunk = ''; // --- FIX: Keep track of the last chunk ---
 
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
         
         const chunk = decoder.decode(value, { stream: true });
-        setMessages(prev => {
-          const newMessages = [...prev];
-          newMessages[newMessages.length - 1].text += chunk;
-          return newMessages;
-        });
+
+        // --- FIX: Check for and prevent duplicate chunks ---
+        if (chunk !== lastChunk) {
+            setMessages(prev => {
+              const newMessages = [...prev];
+              newMessages[newMessages.length - 1].text += chunk;
+              return newMessages;
+            });
+            lastChunk = chunk;
+        }
       }
 
     } catch (error) {
@@ -62,7 +70,7 @@ const ChatPage = ({ teamId, onLogout }) => {
          const lastMessage = newMessages[newMessages.length - 1];
          if (lastMessage && lastMessage.sender === 'bot') {
             lastMessage.text = 'Sorry, I had a problem thinking. Please try again.';
-            lastMessage.error = true; // Mark this message as an error
+            lastMessage.error = true;
          }
          return newMessages;
       });
@@ -88,18 +96,18 @@ const ChatPage = ({ teamId, onLogout }) => {
               className={`flex items-end gap-2 ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}
             >
               <div
-                className={`max-w-xs md:max-w-md lg:max-w-lg p-3 rounded-2xl transition-colors ${
+                className={`prose prose-sm max-w-xs md:max-w-md lg:max-w-lg p-3 rounded-2xl transition-colors ${
                   msg.sender === 'user'
                     ? 'bg-green-500 text-black rounded-br-none'
                     : msg.error
-                    ? 'bg-red-500 text-white rounded-bl-none' // Error style
-                    : 'bg-slate-200 text-slate-800 rounded-bl-none' // Normal bot style
+                    ? 'bg-red-500 text-white rounded-bl-none'
+                    : 'bg-slate-200 text-slate-800 rounded-bl-none'
                 }`}
               >
-                <p className="text-sm" style={{ whiteSpace: 'pre-wrap' }}>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>
                   {msg.text}
-                  {isLoading && index === messages.length - 1 && !msg.text && <span className="animate-pulse">...</span>}
-                </p>
+                </ReactMarkdown>
+                {isLoading && index === messages.length - 1 && <span className="animate-pulse">...</span>}
               </div>
             </div>
           ))}
