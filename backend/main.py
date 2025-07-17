@@ -91,7 +91,6 @@ class TeamData(BaseModel):
 async def get_live_fpl_data():
     """
     Gets live FPL data (bootstrap, fixtures, injuries) using a cache.
-    This is an upgrade that combines multiple data sources.
     """
     if 'live_data' in fpl_live_data_cache:
         print("CACHE HIT: Returning cached live FPL data.")
@@ -99,7 +98,6 @@ async def get_live_fpl_data():
     
     print("CACHE MISS: Fetching new live data from FPL API.")
     async with httpx.AsyncClient() as client:
-        # Fetch bootstrap and fixtures data concurrently
         bootstrap_task = client.get(FPL_API_BOOTSTRAP)
         fixtures_task = client.get(FPL_API_FIXTURES)
         bootstrap_res, fixtures_res = await asyncio.gather(bootstrap_task, fixtures_task)
@@ -110,10 +108,8 @@ async def get_live_fpl_data():
         bootstrap_data = bootstrap_res.json()
         fixtures_data = fixtures_res.json()
 
-        # --- Process the data to make it more useful ---
         teams_map = {team['id']: team['short_name'] for team in bootstrap_data['teams']}
         
-        # Process injuries and form
         player_details = {}
         for p in bootstrap_data['elements']:
             player_details[p['id']] = {
@@ -124,17 +120,16 @@ async def get_live_fpl_data():
                 'form': p['form']
             }
         
-        # Process upcoming fixtures
         upcoming_fixtures = {}
         current_gameweek = next((gw['id'] for gw in bootstrap_data['events'] if gw['is_current']), None)
         if current_gameweek:
-            for team_id in teams_map:
+            for team_id_num in teams_map:
                 team_fixtures = [
-                    f"{teams_map[f['team_a']]} (A) [{f['difficulty']}]" if f['team_h'] != team_id else f"{teams_map[f['team_h']]} (H) [{f['difficulty']}]"
+                    f"{teams_map[f['team_a']]} (A) [{f['team_a_difficulty']}]" if f['team_h'] != team_id_num else f"{teams_map[f['team_h']]} (H) [{f['team_h_difficulty']}]"
                     for f in fixtures_data 
-                    if (f['team_h'] == team_id or f['team_a'] == team_id) and f['event'] and f['event'] >= current_gameweek
+                    if f.get('event') and (f['team_h'] == team_id_num or f['team_a'] == team_id_num) and f['event'] >= current_gameweek
                 ]
-                upcoming_fixtures[teams_map[team_id]] = team_fixtures[:3] # Get the next 3 fixtures
+                upcoming_fixtures[teams_map[team_id_num]] = team_fixtures[:3]
 
         live_data = {
             "bootstrap": bootstrap_data,
@@ -180,59 +175,71 @@ async def stream_chat_response(request: ChatRequest):
         team_data = await get_team_data(request.team_id)
         live_data = await get_live_fpl_data()
 
-        # --- RAG IMPLEMENTATION ---
-        historical_context = ""
+        # RAG Search for relevant players
+        context_players = set()
         if vector_index and embedding_model:
             print("Performing RAG search...")
             question_embedding = embedding_model.encode([request.question])
             k = 3
             distances, indices = vector_index.search(question_embedding, k)
-            
-            retrieved_players = set()
             for i in indices[0]:
                 if i != -1:
                     player_name = player_id_map.get(i)
                     if player_name:
-                        retrieved_players.add(player_name)
-            
-            if retrieved_players:
-                historical_context += "\n\n--- Relevant Historical & Live Context ---\n"
-                for name in retrieved_players:
-                    historical_context += f"Player: {name}\n"
-                    # Add historical data
-                    if name in historical_data_store:
-                        historical_context += f"Historical Performance: {json.dumps(historical_data_store[name])}\n"
-                    # Add live data (injury, form, fixtures)
-                    player_id = next((pid for pid, pdata in live_data['player_details'].items() if pdata['name'] == name), None)
-                    if player_id:
-                        details = live_data['player_details'][player_id]
-                        team_name = live_data['bootstrap']['teams'][details['team_id']-1]['short_name']
-                        historical_context += (f"Live Status: Form: {details['form']}, "
-                                               f"Injury: {details['news'] if details['news'] else 'Available'}\n")
-                        historical_context += f"Upcoming Fixtures for {team_name}: {', '.join(live_data['upcoming_fixtures'].get(team_name, []))}\n"
+                        context_players.add(player_name)
+        
+        # Add players from the user's team to the context
+        for player in team_data.players:
+            context_players.add(player.name)
 
-                historical_context += "---------------------------------\n"
-                print(f"Retrieved context for: {', '.join(retrieved_players)}")
+        # Build the context string
+        context_block = ""
+        if context_players:
+            context_block += "\n\n--- CONTEXTUAL DATA ---\n"
+            for name in context_players:
+                context_block += f"Player: **{name}**\n"
+                # Add live data first
+                player_id = next((pid for pid, pdata in live_data['player_details'].items() if pdata['name'] == name), None)
+                if player_id:
+                    details = live_data['player_details'][player_id]
+                    team_id_num = details.get('team_id')
+                    if team_id_num:
+                        team_name = next((t['short_name'] for t in live_data['bootstrap']['teams'] if t['id'] == team_id_num), None)
+                        if team_name:
+                            context_block += (f"* **Live Status:** Form: {details.get('form', 'N/A')}, "
+                                              f"Injury: {details.get('news', 'Available') or 'Available'}\n")
+                            context_block += f"* **Upcoming Fixtures:** {', '.join(live_data['upcoming_fixtures'].get(team_name, ['N/A']))}\n"
+                # Add historical data second
+                if name in historical_data_store:
+                    context_block += f"* **Historical Note:** {json.dumps(historical_data_store[name])}\n"
+            context_block += "-----------------------\n"
+            print(f"Retrieved context for: {', '.join(context_players)}")
 
+        # --- NEW & IMPROVED PROMPT ---
         prompt = f"""
         You are "FPL AI", a world-class Fantasy Premier League analyst. Your tone is insightful, data-driven, and slightly witty.
-        A user is asking for advice.
+        A user is asking for advice about their team.
 
-        First, consider the user's current team data for Gameweek {team_data.gameweek}:
+        Here is the user's question: "{request.question}"
+
+        Here is the user's current team data:
         {team_data.model_dump_json(indent=2)}
 
-        Second, consider this potentially relevant live and historical context retrieved from your knowledge base:
-        {historical_context if historical_context else "No specific context was found to be relevant to the user's question."}
+        Here is the contextual data you have on relevant players (live data is most important):
+        {context_block if context_block else "No specific context was found to be relevant to the user's question."}
 
-        Finally, answer the user's question: "{request.question}"
+        **Your Task:**
+        Based on ALL of the data above, answer the user's question.
 
-        Follow these rules for your response:
-        1.  **Formatting is key.** Use Markdown for clarity. Use bold text for player names and key terms. Use bullet points (*) for lists of suggestions.
-        2.  **Be Concise.** Get straight to the point. Avoid repetitive phrases.
-        3.  **Synthesize.** Combine information from the user's current team, live data (form, injuries, fixtures), and historical context to form your answer.
-        4.  **Cite Your Sources.** If you use specific data, mention it (e.g., "**Salah** is in great form (9.0) and has a good upcoming fixture against Luton (H) [2].").
-        5.  **Be Honest About Limitations.** If the data is insufficient, state this clearly and provide actionable advice on what the user should look for themselves.
-        6.  **Structure your answer.** Start with a direct recommendation, then provide the reasoning and supporting data.
+        **Reasoning Hierarchy (IMPORTANT):**
+        1.  **Prioritize Live Data:** Your primary analysis MUST be based on current form, injury status, and upcoming fixtures. This is the most critical information.
+        2.  **Consider User's Team:** Analyze the players the user actually owns.
+        3.  **Use Historical Data as Secondary Context:** Only use historical data to support your analysis of current form (e.g., "he has a history of performing well in the final gameweeks") or if the question is specifically about the past. Do NOT base your primary recommendation on historical data.
+
+        **Response Rules:**
+        * **Formatting:** Use Markdown. Use **bold** for player names. Use bullet points (*) for lists.
+        * **Conciseness:** Be direct. Avoid filler words and repetitive phrases.
+        * **Honesty:** If you don't have enough information from the data provided, state it clearly and suggest where the user can find the information they need (e.g., "For the latest team news, check Fantasy Football Scout or team-specific news sites.").
         """
 
         model = genai.GenerativeModel('gemini-1.5-flash')
