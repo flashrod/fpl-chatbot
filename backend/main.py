@@ -188,7 +188,6 @@ async def stream_chat_response(request: ChatRequest):
                     if player_name:
                         context_players.add(player_name)
         
-        # Add players from the user's team to the context
         for player in team_data.players:
             context_players.add(player.name)
 
@@ -198,7 +197,6 @@ async def stream_chat_response(request: ChatRequest):
             context_block += "\n\n--- CONTEXTUAL DATA ---\n"
             for name in context_players:
                 context_block += f"Player: **{name}**\n"
-                # Add live data first
                 player_id = next((pid for pid, pdata in live_data['player_details'].items() if pdata['name'] == name), None)
                 if player_id:
                     details = live_data['player_details'][player_id]
@@ -209,27 +207,15 @@ async def stream_chat_response(request: ChatRequest):
                             context_block += (f"* **Live Status:** Form: {details.get('form', 'N/A')}, "
                                               f"Injury: {details.get('news', 'Available') or 'Available'}\n")
                             context_block += f"* **Upcoming Fixtures:** {', '.join(live_data['upcoming_fixtures'].get(team_name, ['N/A']))}\n"
-                # Add historical data second
                 if name in historical_data_store:
                     context_block += f"* **Historical Note:** {json.dumps(historical_data_store[name])}\n"
             context_block += "-----------------------\n"
             print(f"Retrieved context for: {', '.join(context_players)}")
 
-        # --- NEW & IMPROVED PROMPT ---
+        # --- FINAL, IMPROVED PROMPT ---
         prompt = f"""
         You are "FPL AI", a world-class Fantasy Premier League analyst. Your tone is insightful, data-driven, and slightly witty.
-        A user is asking for advice about their team.
-
-        Here is the user's question: "{request.question}"
-
-        Here is the user's current team data:
-        {team_data.model_dump_json(indent=2)}
-
-        Here is the contextual data you have on relevant players (live data is most important):
-        {context_block if context_block else "No specific context was found to be relevant to the user's question."}
-
-        **Your Task:**
-        Based on ALL of the data above, answer the user's question.
+        Your task is to answer the user's question based on all the data provided.
 
         **Reasoning Hierarchy (IMPORTANT):**
         1.  **Prioritize Live Data:** Your primary analysis MUST be based on current form, injury status, and upcoming fixtures. This is the most critical information.
@@ -237,9 +223,25 @@ async def stream_chat_response(request: ChatRequest):
         3.  **Use Historical Data as Secondary Context:** Only use historical data to support your analysis of current form (e.g., "he has a history of performing well in the final gameweeks") or if the question is specifically about the past. Do NOT base your primary recommendation on historical data.
 
         **Response Rules:**
-        * **Formatting:** Use Markdown. Use **bold** for player names. Use bullet points (*) for lists.
-        * **Conciseness:** Be direct. Avoid filler words and repetitive phrases.
-        * **Honesty:** If you don't have enough information from the data provided, state it clearly and suggest where the user can find the information they need (e.g., "For the latest team news, check Fantasy Football Scout or team-specific news sites.").
+        * **Structure:**
+            1.  **Assessment:** Start with a one-sentence summary of the situation.
+            2.  **Key Insights:** Use a bulleted list (*) to present the most important points from your analysis.
+            3.  **Recommendation:** End with a clear, actionable recommendation.
+        * **Formatting:** Use Markdown. Use **bold** for player names and key terms.
+        * **Conciseness:** Be direct. Do not repeat information or use filler phrases.
+        * **Honesty:** If the data is insufficient, state it clearly and suggest where the user can find the information they need (e.g., "For the latest team news, check Fantasy Football Scout.").
+
+        ---
+        **User's Question:** "{request.question}"
+        
+        **User's Team Data:**
+        {team_data.model_dump_json(indent=2)}
+
+        **Contextual Data:**
+        {context_block if context_block else "No specific context was found to be relevant to the user's question."}
+        ---
+        
+        Now, provide your expert analysis.
         """
 
         model = genai.GenerativeModel('gemini-1.5-flash')
