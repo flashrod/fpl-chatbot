@@ -45,7 +45,6 @@ def calculate_gameweek_difficulty(gw: int, team_fixtures_in_gw: Dict[int, int], 
     double_gw_teams = {tid: count for tid, count in team_fixtures_in_gw.items() if count > 1}
     avg_difficulty = sum(team_avg_difficulty.values()) / len(team_avg_difficulty) if team_avg_difficulty else 3
     
-    # A simple scoring model: lower is better. Penalize high difficulty, reward double gameweeks.
     difficulty_score = (avg_difficulty * 0.3) - (len(double_gw_teams) * 5)
     
     return {
@@ -73,7 +72,7 @@ def get_recommended_players(live_data: Dict[str, Any], position_filter: int = No
         points = player.get("total_points", 0)
         minutes = player.get("minutes", 0)
         
-        if minutes < 500: # Filter out players with very few minutes
+        if minutes < 500:
             continue
 
         team_info = teams_map.get(team_id)
@@ -86,13 +85,11 @@ def get_recommended_players(live_data: Dict[str, Any], position_filter: int = No
         
         upcoming_fixtures_text = live_data.get('upcoming_fixtures', {}).get(team_short_name, [])
         
-        # A simple heuristic for fixture difficulty from the text
         try:
             avg_difficulty = sum([int(f.split('[')[1].split(']')[0]) for f in upcoming_fixtures_text]) / len(upcoming_fixtures_text) if upcoming_fixtures_text else 3
         except (IndexError, ValueError):
-            avg_difficulty = 3 # Default difficulty
+            avg_difficulty = 3
 
-        # Composite score
         score = (form * 3) + ((5 - avg_difficulty) * 1.5) + (points / 20)
         
         player_scores.append({

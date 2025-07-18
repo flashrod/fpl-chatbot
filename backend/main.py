@@ -16,7 +16,6 @@ from dotenv import load_dotenv
 from cachetools import TTLCache
 from fastapi.responses import StreamingResponse
 
-# Import the new chip service
 import chip_service
 
 # --- Configuration ---
@@ -46,7 +45,6 @@ app = FastAPI(title="FPL AI Chatbot API")
 
 @app.on_event("startup")
 def load_data_and_models():
-    """Load all necessary data and models into memory when the app starts."""
     global historical_data_store, vector_index, embedding_model, player_id_map
     if PROCESSED_DATA_PATH.exists():
         with open(PROCESSED_DATA_PATH, 'r', encoding='utf-8') as f:
@@ -133,9 +131,6 @@ async def get_live_fpl_data():
 
 @app.get("/api/get-team-data/{team_id}", response_model=TeamData)
 async def get_team_data(team_id: int):
-    """
-    Fetches the user's FPL team data, including team colors for the UI.
-    """
     try:
         live_data = await get_live_fpl_data()
         bootstrap_data = live_data['bootstrap']
