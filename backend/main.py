@@ -7,7 +7,7 @@ from typing import List, Tuple
 import re
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from fastapi.responses import StreamingResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -66,6 +66,10 @@ async def load_and_process_all_data():
 
     teams_map = {team['id']: team['short_name'] for team in bootstrap_data['teams']}
     position_map = {p_type['id']: p_type['singular_name_short'] for p_type in bootstrap_data['element_types']}
+    
+    # Store full team names for context building
+    app.state.full_team_names = {team['short_name']: team['name'] for team in bootstrap_data['teams']}
+
 
     fpl_players_df = pd.DataFrame(bootstrap_data['elements'])
     fpl_players_df['team_name'] = fpl_players_df['team'].map(teams_map)
@@ -161,9 +165,15 @@ class Player(BaseModel):
 class TeamData(BaseModel):
     players: List[Player]
 
+class ChatMessage(BaseModel):
+    role: str
+    text: str
+
 class ChatRequest(BaseModel):
     team_id: int
     question: str
+    history: List[ChatMessage] = Field(default_factory=list)
+
 
 # --- API Endpoints ---
 @app.get("/api/fixture-difficulty")
@@ -206,66 +216,116 @@ async def get_team_data(team_id: int):
         print(f"Error in get_team_data: {e}")
         raise HTTPException(status_code=500, detail="An unexpected server error occurred.")
 
-# --- NEW: Intelligent Context Builder ---
-def build_context_for_question(question: str, all_players_df: pd.DataFrame) -> Tuple[str, List[str]]:
+# --- Re-architected Intelligent Context Builder ---
+def _find_team_and_position(question_lower: str, full_team_names: dict) -> Tuple[str, str]:
+    """Helper to find team and position keywords in a question."""
+    position_map = {
+        'defenders': 'DEF', 'defender': 'DEF', 'defs': 'DEF',
+        'midfielders': 'MID', 'midfielder': 'MID', 'mids': 'MID',
+        'forwards': 'FWD', 'forward': 'FWD', 'fwds': 'FWD',
+        'goalkeepers': 'GKP', 'goalkeeper': 'GKP', 'gk': 'GKP'
+    }
+    team_found_short_name = None
+    pos_found_code = None
+    for short_name, full_name in full_team_names.items():
+        if full_name.lower() in question_lower or short_name.lower() in question_lower:
+            team_found_short_name = short_name
+            break
+    for pos_str, pos_code in position_map.items():
+        if pos_str in question_lower:
+            pos_found_code = pos_code
+            break
+    return team_found_short_name, pos_found_code
+
+def build_context_for_question(question: str, all_players_df: pd.DataFrame, full_team_names: dict) -> Tuple[str, List[str]]:
     """
     Analyzes the user's question to build the most relevant context for the AI.
     """
     question_lower = question.lower()
-    player_names_found = []
     
-    # 1. Find specific player names mentioned
-    question_words = set(question_lower.replace("'", "").replace("’", "").split())
+    # --- Intent 1: List all players from a specific team and/or position ---
+    team_found, pos_found = _find_team_and_position(question_lower, full_team_names)
+    if team_found:
+        df_filtered = all_players_df[all_players_df['team_name'] == team_found]
+        if pos_found:
+            df_filtered = df_filtered[df_filtered['position'] == pos_found]
+        
+        if not df_filtered.empty:
+            pos_str = pos_found or 'Players'
+            team_full_name = full_team_names.get(team_found, team_found)
+            title = f"List of {team_full_name} {pos_str}"
+            summary = f"\n--- {title} ---\n"
+            for _, player in df_filtered.sort_values(by='now_cost', ascending=False).iterrows():
+                summary += f"- {player.name} ({player.position}) - £{player.now_cost/10.0:.1f}m\n"
+            return summary, []
+
+    # --- Intent 2: Find a specific player with advanced scoring ---
+    player_matches = {}
+    question_words = set(re.findall(r'\b\w{2,}\b', question_lower))
+
     for name in all_players_df.index:
         if isinstance(name, str):
+            score = 0
+            player_name_parts = name.lower().replace('.', '').split()
+            surname = player_name_parts[-1]
+
             for word in question_words:
-                if len(word) > 3 and any(part.startswith(word) for part in name.lower().split()):
-                    if name not in player_names_found:
-                        player_names_found.append(name)
-                    break
-    
-    if player_names_found:
-        return "", player_names_found # Return just the names for specific player questions
+                if word == surname:
+                    score += 10
+                elif word in player_name_parts:
+                    score += 2
+            
+            if score > 0:
+                player_matches[name] = score
 
-    # 2. Handle general "Top X" questions if no specific player is found
-    # Regex to find patterns like "top 3", "top 5", "most expensive"
-    top_x_match = re.search(r'top (\d+)', question_lower)
-    limit = int(top_x_match.group(1)) if top_x_match else 5 # Default to top 5
+    if player_matches:
+        max_score = max(player_matches.values())
+        if max_score >= 10:
+            player_names_found = [name for name, score in player_matches.items() if score >= max_score * 0.8]
+            return "", player_names_found
 
-    position_map = {
-        'defenders': 'DEF', 'defender': 'DEF',
-        'midfielders': 'MID', 'midfielder': 'MID',
-        'forwards': 'FWD', 'forward': 'FWD',
-        'goalkeepers': 'GKP', 'goalkeeper': 'GKP'
-    }
-    
-    df_filtered = all_players_df.copy()
-    
-    # Filter by position
-    pos_found = None
-    for pos_str, pos_code in position_map.items():
-        if pos_str in question_lower:
-            df_filtered = df_filtered[df_filtered['position'] == pos_code]
-            pos_found = pos_str
-            break
-
-    # Determine sorting metric (cost, form, etc.)
-    sort_by = 'now_cost'
-    ascending = False
-    metric_str = "Most Expensive"
-    if "cheap" in question_lower:
-        ascending = True
-        metric_str = "Cheapest"
-    
-    # Generate the context summary
-    top_players = df_filtered.sort_values(by=sort_by, ascending=ascending).head(limit)
-    
-    title = f"Top {limit} {metric_str} {pos_found or 'Players'}"
-    summary = f"\n--- {title} ---\n"
-    for _, player in top_players.iterrows():
-        summary += f"- {player.name} ({player.team_name}, {player.position}) - £{player.now_cost/10.0:.1f}m\n"
+    # --- Intent 3: Handle general "Top X" questions ---
+    trigger_words = ['top', 'most', 'best', 'cheapest', 'worst']
+    if any(word in question_lower for word in trigger_words):
+        top_x_match = re.search(r'top (\d+)', question_lower)
+        limit = int(top_x_match.group(1)) if top_x_match else 5
         
-    return summary, []
+        df_filtered = all_players_df.copy()
+        _, pos_found_code = _find_team_and_position(question_lower, full_team_names)
+        pos_found_str = pos_found_code or 'Players'
+
+        if pos_found_code:
+            df_filtered = df_filtered[df_filtered['position'] == pos_found_code]
+
+        sort_by = 'now_cost'
+        ascending = False
+        metric_str = "Most Expensive"
+        if "cheap" in question_lower:
+            ascending = True
+            metric_str = "Cheapest"
+        elif "selected" in question_lower or "ownership" in question_lower:
+            sort_by = 'selected_by_percent'
+            metric_str = "Most Selected"
+        elif "form" in question_lower:
+            sort_by = 'form'
+            metric_str = "Best Form"
+
+        df_filtered[sort_by] = pd.to_numeric(df_filtered[sort_by], errors='coerce')
+        
+        top_players = df_filtered.sort_values(by=sort_by, ascending=ascending).head(limit)
+        
+        title = f"Top {limit} {metric_str} {pos_found_str}"
+        summary = f"\n--- {title} ---\n"
+        for _, player in top_players.iterrows():
+            value = player[sort_by]
+            if sort_by == 'now_cost':
+                summary += f"- {player.name} ({player.team_name}, {player.position}) - £{value/10.0:.1f}m\n"
+            else:
+                summary += f"- {player.name} ({player.team_name}, {player.position}) - {value}\n"
+            
+        return summary, []
+
+    return "", []
 
 
 @app.post("/api/chat")
@@ -288,18 +348,18 @@ async def stream_chat_response(request: ChatRequest):
                 if picks_res.status_code == 200:
                     player_ids = [pick['element'] for pick in picks_res.json().get('picks', [])]
                 elif picks_res.status_code == 404:
-                    user_notes += "(Note: Could not fetch your team. The Team ID might be incorrect or you haven't picked a team for this gameweek yet.)\n"
+                    user_notes += "(Note: Could not fetch your team.)\n"
                 else:
                     user_notes += "(Note: There was a temporary issue fetching your FPL team.)\n"
         except Exception as e:
             print(f"Error fetching picks: {e}")
             user_notes += "(Note: An unexpected error occurred while fetching your FPL team.)\n"
     else:
-        user_notes += "(Note: The FPL game is currently in pre-season, so I can't fetch your specific team. You can still ask general player questions.)\n"
+        user_notes += "(Note: The FPL game is in pre-season, so I can't fetch your team.)\n"
 
     try:
-        # Use the new intelligent context builder
-        general_summary, players_from_question = build_context_for_question(request.question, master_fpl_data)
+        full_conversation = " ".join([h.text for h in request.history if h.role == 'user']) + " " + request.question
+        general_summary, players_from_question = build_context_for_question(full_conversation, master_fpl_data, app.state.full_team_names)
         
         players_from_team = master_fpl_data[master_fpl_data['id'].isin(player_ids)].index.tolist()
         all_player_names = sorted(list(set(players_from_team + players_from_question)))
@@ -309,6 +369,9 @@ async def stream_chat_response(request: ChatRequest):
             master_fpl_data['upcoming_fixtures'] = master_fpl_data['fixture_details'].apply(
                 lambda details: ", ".join([f"{f['opponent']} ({'H' if f['is_home'] else 'A'}) [{f['difficulty']}]" for f in details]) if isinstance(details, list) else ""
             )
+            if len(all_player_names) > 1 and not players_from_team:
+                 context_block += "Found multiple players matching your query. Here is the data for all of them:\n\n"
+
             for name in all_player_names:
                 if name in master_fpl_data.index:
                     player = master_fpl_data.loc[name]
@@ -319,7 +382,7 @@ async def stream_chat_response(request: ChatRequest):
         elif general_summary:
             context_block = general_summary
         else:
-            context_block += "No specific player data found relevant to the question."
+            context_block += "I couldn't find specific data for your query. Please try rephrasing your question."
         
         if not is_game_live:
             system_instruction = """
@@ -327,36 +390,45 @@ async def stream_chat_response(request: ChatRequest):
             Your task is to answer the user's question based on the data provided in the "Analysis" section.
             
             **Instructions:**
-            1.  If the context provides specific player data (Price, Fixtures), use that to answer the question.
-            2.  If the context provides a general summary (like 'Top 5 Most Expensive Players'), use that list to answer the question.
+            1.  If the context provides specific player data, use that to answer. If multiple players are listed, provide info for all of them.
+            2.  If the context provides a general summary (like a 'Top 5' list), you must present the entire list.
             3.  Acknowledge that performance stats (xG, goals) are not available yet.
             4.  **DO NOT state that you don't have information if it is present in the context.** You must use the data provided.
             """
         else:
             system_instruction = """
             **Reasoning Hierarchy:**
-            1.  **Availability is Key:** If a player has injury **News**, this is the most important factor.
-            2.  **Fixtures Drive Short-Term Decisions:** Use the **Upcoming Fixtures** to recommend transfers.
+            1.  **Availability is Key:** Use injury **News**.
+            2.  **Fixtures Drive Short-Term Decisions:** Use the **Upcoming Fixtures**.
             3.  **Underlying Stats (xG/xAG):** Use these to determine if FPL **Form** is sustainable.
             4.  **Price and Ownership:** Use these to assess value and risk.
             """
+        
+        # --- FIX: Map 'bot' role to 'model' for the Gemini API ---
+        gemini_history = []
+        for h in request.history:
+            role = "model" if h.role == "bot" else "user"
+            gemini_history.append({"role": role, "parts": [{"text": h.text}]})
+        gemini_history.append({"role": "user", "parts": [{"text": request.question}]})
+        # --- END OF FIX ---
 
         prompt = f"""
-        You are "FPL Brain", the world's most advanced Fantasy Premier League analyst.
+        You are "FPL Brain", an expert FPL analyst.
         
         {system_instruction}
 
         ---
-        **User's Question:** "{request.question}"
         **Analysis of Available Player Data:**
         {context_block}
         ---
         
-        Now, provide your expert, multi-faceted FPL recommendation.
+        Now, provide your expert recommendation based on the user's question and the provided data.
         """
+        
+        model = genai.GenerativeModel('gemini-2.0-flash', system_instruction=prompt)
+        chat = model.start_chat(history=gemini_history[:-1])
+        response_stream = await chat.send_message_async(gemini_history[-1]['parts'], stream=True)
 
-        model = genai.GenerativeModel('gemini-2.0-flash')
-        response_stream = await model.generate_content_async(prompt, stream=True)
 
         async for chunk in response_stream:
             if chunk.text:
