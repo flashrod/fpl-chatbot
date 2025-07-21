@@ -4,6 +4,7 @@ import asyncio
 import pandas as pd
 from pathlib import Path
 from typing import List
+import json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -58,20 +59,44 @@ async def load_and_process_all_data():
 
     bootstrap_data = bootstrap_res.json()
     fixtures_data = fixtures_res.json()
+    
+    # --- DEBUGGING: Print a sample of the raw player data from the API ---
+    print("\n--- DEBUG: Sample Raw Player Data from FPL API ---")
+    if bootstrap_data.get('elements'):
+        print(json.dumps(bootstrap_data['elements'][0], indent=2))
+    else:
+        print("No 'elements' key found in bootstrap data.")
+    # --- END DEBUGGING ---
 
     is_game_live = any(gw.get('is_current', False) for gw in bootstrap_data['events'])
     current_gameweek_id = next((gw['id'] for gw in bootstrap_data['events'] if gw.get('is_current', False)), 1)
     print(f"ℹ️ FPL game live status: {is_game_live}. Current GW: {current_gameweek_id}")
 
     teams_map = {team['id']: team['short_name'] for team in bootstrap_data['teams']}
-    # ADDITION: Create a map for player positions (GKP, DEF, etc.)
     position_map = {p_type['id']: p_type['singular_name_short'] for p_type in bootstrap_data['element_types']}
 
     fpl_players_df = pd.DataFrame(bootstrap_data['elements'])
     fpl_players_df['team_name'] = fpl_players_df['team'].map(teams_map)
-    # ADDITION: Add the player's position name to the DataFrame
     fpl_players_df['position'] = fpl_players_df['element_type'].map(position_map)
     fpl_players_df = fpl_players_df.rename(columns={'web_name': 'Player'})
+    
+    # --- DEBUGGING: Check player names as they appear in the DataFrame ---
+    print("\n--- DEBUG: Checking for 'Salah' in Player Names from API ---")
+    salah_in_df = 'Salah' in fpl_players_df['Player'].values
+    print(f"Is 'Salah' an exact match in the 'Player' column? -> {salah_in_df}")
+    if not salah_in_df:
+        print("Could not find exact match for 'Salah'. Searching for partial match...")
+        salah_partial = fpl_players_df[fpl_players_df['Player'].str.contains("Salah", case=False)]
+        if not salah_partial.empty:
+            print("Found partial match(es):")
+            print(salah_partial[['Player', 'team_name']].to_dict('records'))
+        else:
+            print("Could not find any partial match for 'Salah' either.")
+            print("First 20 player names from API for review:")
+            print(fpl_players_df['Player'].head(20).tolist())
+    print("--- END DEBUGGING ---\n")
+    # --- END DEBUGGING ---
+
 
     fixtures_df = pd.DataFrame(fixtures_data)
     upcoming_fixtures_data = {}
@@ -169,20 +194,15 @@ class ChatRequest(BaseModel):
 # --- API Endpoints ---
 @app.get("/api/fixture-difficulty")
 async def get_fixture_difficulty_data():
-    """ Provides a sorted list of teams by their average fixture difficulty. """
     return chip_service.get_all_team_fixture_difficulty(master_fpl_data)
 
 @app.get("/api/chip-recommendations")
 async def get_chip_recommendations_data():
-    """ Provides AI-driven chip recommendations. """
     return chip_service.calculate_chip_recommendations(master_fpl_data)
 
-# NEW ENDPOINT FOR TEAM DASHBOARD
 @app.get("/api/get-team-data/{team_id}", response_model=TeamData)
 async def get_team_data(team_id: int):
-    """ Fetches a user's current player list for the team dashboard. """
     if master_fpl_data is None or not is_game_live:
-        # If the game is off-season, return empty team to prevent frontend error
         return TeamData(players=[])
 
     try:
@@ -191,12 +211,10 @@ async def get_team_data(team_id: int):
             picks_res = await client.get(picks_url)
             
             if picks_res.status_code != 200:
-                # This can happen if the team ID is wrong or they have no team for the GW
                 raise HTTPException(status_code=404, detail=f"Could not find a team for ID {team_id} in the current gameweek.")
             
             player_ids = [pick['element'] for pick in picks_res.json().get('picks', [])]
 
-        # Filter the master data to get the players on the user's team
         team_df = master_fpl_data[master_fpl_data['id'].isin(player_ids)]
         
         players_list = []
@@ -217,7 +235,6 @@ async def get_team_data(team_id: int):
 
 @app.post("/api/chat")
 async def chat_with_bot(request: ChatRequest):
-    """ Main endpoint for chat, which now handles team data internally. """
     return StreamingResponse(stream_chat_response(request), media_type="text/event-stream")
 
 async def stream_chat_response(request: ChatRequest):
@@ -243,7 +260,7 @@ async def stream_chat_response(request: ChatRequest):
             print(f"Error fetching picks: {e}")
             user_notes += "(Note: An unexpected error occurred while fetching your FPL team.)\n"
     else:
-        user_notes += "(Note: The FPL game is currently between seasons, so I can't fetch your team. You can still ask general player questions.)\n"
+        user_notes += "(Note: The FPL game is currently in pre-season, so I can't fetch your specific team. You can still ask general player questions.)\n"
 
     try:
         player_names = master_fpl_data[master_fpl_data['id'].isin(player_ids)].index.tolist()
@@ -253,7 +270,6 @@ async def stream_chat_response(request: ChatRequest):
                 player_names.append(name)
 
         context_block = f"\n\n--- Player Analysis ---\n{user_notes}\n"
-        # Recreate the upcoming_fixtures string for the prompt context
         master_fpl_data['upcoming_fixtures'] = master_fpl_data['fixture_details'].apply(
             lambda details: ", ".join([f"{f['opponent']} ({'H' if f['is_home'] else 'A'}) [{f['difficulty']}]" for f in details]) if isinstance(details, list) else ""
         )
@@ -275,24 +291,43 @@ async def stream_chat_response(request: ChatRequest):
                 fixture_context = f"  - **Upcoming Fixtures:** {player.upcoming_fixtures}\n"
                 context_block += fpl_context + fbref_context + fixture_context
         
+        # --- NEW: More Forceful and Specific Prompt Instructions ---
+        if not is_game_live:
+            system_instruction = """
+            **IMPORTANT: You are in PRE-SEASON mode.**
+            Your task is to evaluate a player's value based on the data provided in the "Player Analysis" section.
+            
+            **Instructions:**
+            1.  Find the player mentioned in the user's question within the "Player Analysis" block.
+            2.  Extract their **Price** from the "FPL Status" line.
+            3.  Extract their team's opening games from the "Upcoming Fixtures" line.
+            4.  Formulate your answer based ONLY on this price and fixture information. Acknowledge that performance stats (xG, goals) are not available yet because no matches have been played.
+            5.  **DO NOT state that you don't have the player's information if they are listed in the data below.** You must use the data provided.
+            """
+        else:
+            system_instruction = """
+            **Reasoning Hierarchy:**
+            1.  **Availability is Key:** If a player has injury **News**, this is the most important factor.
+            2.  **Fixtures Drive Short-Term Decisions:** Use the **Upcoming Fixtures** (with difficulty scores) to recommend immediate transfers.
+            3.  **Underlying Stats (xG/xAG) Predict Future Returns:** Use a player's **Season Stats** to determine if their FPL **Form** is sustainable.
+            4.  **Price and Ownership as Context:** Use **Price** and **Selected By %** to assess value and risk.
+            """
+
         prompt = f"""
-        You are "FPL Brain", the world's most advanced Fantasy Premier League analyst. You have access to a complete dataset combining live FPL data and deep performance stats.
-        Your task is to provide expert advice by synthesizing all available information.
-        **Reasoning Hierarchy:**
-        1.  **Availability is Key:** If a player has injury **News**, this is the most important factor.
-        2.  **Fixtures Drive Short-Term Decisions:** Use the **Upcoming Fixtures** (with difficulty scores) to recommend immediate transfers. Easy fixtures are a huge plus.
-        3.  **Underlying Stats (xG/xAG) Predict Future Returns:** Use a player's **Season Stats** to determine if their FPL **Form** is sustainable. A player with high xG and low Form is a great target. A player with high Form but low xG might be getting lucky.
-        4.  **Price and Ownership as Context:** Use **Price** and **Selected By %** to assess value and risk. A cheap, low-ownership player with good stats and fixtures is a differential gem.
-        5.  **Acknowledge Missing Data:** If you see a note about not being able to fetch the user's team, incorporate that into your answer gracefully.
+        You are "FPL Brain", the world's most advanced Fantasy Premier League analyst.
+        
+        {system_instruction}
+
         ---
         **User's Question:** "{request.question}"
-        **Analysis of User's Players:**
+        **Analysis of Available Player Data:**
         {context_block}
         ---
+        
         Now, provide your expert, multi-faceted FPL recommendation.
         """
 
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-2.0-flash')
         response_stream = await model.generate_content_async(prompt, stream=True)
 
         async for chunk in response_stream:

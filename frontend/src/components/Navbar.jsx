@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import { LayoutDashboard, MessageSquare, Wand2, CalendarDays, ChevronsLeft, ChevronsRight, LogOut } from 'lucide-react';
+import { LayoutDashboard, MessageSquare, Wand2, CalendarDays, Trophy, ChevronsLeft, ChevronsRight, LogOut } from 'lucide-react';
 
 const NavBar = ({ isCollapsed, setIsCollapsed, onLogout }) => {
   const location = useLocation();
@@ -11,6 +11,7 @@ const NavBar = ({ isCollapsed, setIsCollapsed, onLogout }) => {
     { path: "/chat", icon: MessageSquare, label: "Chat" },
     { path: "/fixtures", icon: CalendarDays, label: "Fixtures" },
     { path: "/chips", icon: Wand2, label: "Chips" },
+    { path: "/leagues", icon: Trophy, label: "Leagues" }, // Added Leagues link
   ];
 
   return (
