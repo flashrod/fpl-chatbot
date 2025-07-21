@@ -67,7 +67,6 @@ async def load_and_process_all_data():
     teams_map = {team['id']: team['short_name'] for team in bootstrap_data['teams']}
     position_map = {p_type['id']: p_type['singular_name_short'] for p_type in bootstrap_data['element_types']}
     
-    # Store full team names for context building
     app.state.full_team_names = {team['short_name']: team['name'] for team in bootstrap_data['teams']}
 
 
@@ -218,12 +217,11 @@ async def get_team_data(team_id: int):
 
 # --- Re-architected Intelligent Context Builder ---
 def _find_team_and_position(question_lower: str, full_team_names: dict) -> Tuple[str, str]:
-    """Helper to find team and position keywords in a question."""
     position_map = {
         'defenders': 'DEF', 'defender': 'DEF', 'defs': 'DEF',
         'midfielders': 'MID', 'midfielder': 'MID', 'mids': 'MID',
         'forwards': 'FWD', 'forward': 'FWD', 'fwds': 'FWD',
-        'goalkeepers': 'GKP', 'goalkeeper': 'GKP', 'gk': 'GKP'
+        'goalkeepers': 'GKP', 'goalkeeper': 'GKP', 'gk': 'GKP', 'gks': 'GKP'
     }
     team_found_short_name = None
     pos_found_code = None
@@ -238,18 +236,33 @@ def _find_team_and_position(question_lower: str, full_team_names: dict) -> Tuple
     return team_found_short_name, pos_found_code
 
 def build_context_for_question(question: str, all_players_df: pd.DataFrame, full_team_names: dict) -> Tuple[str, List[str]]:
-    """
-    Analyzes the user's question to build the most relevant context for the AI.
-    """
     question_lower = question.lower()
     
-    # --- Intent 1: List all players from a specific team and/or position ---
+    # --- Intent 1: Specific Player Query with Ambiguity Handling ---
+    player_matches = {}
+    question_words = set(re.findall(r'\b\w{2,}\b', question_lower))
+    for name in all_players_df.index:
+        if isinstance(name, str):
+            score = 0
+            player_name_parts = name.lower().replace('.', '').split()
+            surname = player_name_parts[-1]
+            for word in question_words:
+                if word == surname: score += 10
+                elif word in player_name_parts: score += 2
+            if score > 0: player_matches[name] = score
+
+    if player_matches:
+        max_score = max(player_matches.values())
+        # Be more lenient if it's a common short name to handle ambiguity
+        score_threshold = 0.5 if len(question_words) < 3 else 0.8
+        player_names_found = [name for name, score in player_matches.items() if score >= max_score * score_threshold]
+        if player_names_found: return "", player_names_found
+
+    # --- Intent 2: List all players from a specific team and/or position ---
     team_found, pos_found = _find_team_and_position(question_lower, full_team_names)
     if team_found:
         df_filtered = all_players_df[all_players_df['team_name'] == team_found]
-        if pos_found:
-            df_filtered = df_filtered[df_filtered['position'] == pos_found]
-        
+        if pos_found: df_filtered = df_filtered[df_filtered['position'] == pos_found]
         if not df_filtered.empty:
             pos_str = pos_found or 'Players'
             team_full_name = full_team_names.get(team_found, team_found)
@@ -259,70 +272,45 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame, full
                 summary += f"- {player.name} ({player.position}) - £{player.now_cost/10.0:.1f}m\n"
             return summary, []
 
-    # --- Intent 2: Find a specific player with advanced scoring ---
-    player_matches = {}
-    question_words = set(re.findall(r'\b\w{2,}\b', question_lower))
-
-    for name in all_players_df.index:
-        if isinstance(name, str):
-            score = 0
-            player_name_parts = name.lower().replace('.', '').split()
-            surname = player_name_parts[-1]
-
-            for word in question_words:
-                if word == surname:
-                    score += 10
-                elif word in player_name_parts:
-                    score += 2
-            
-            if score > 0:
-                player_matches[name] = score
-
-    if player_matches:
-        max_score = max(player_matches.values())
-        if max_score >= 10:
-            player_names_found = [name for name, score in player_matches.items() if score >= max_score * 0.8]
-            return "", player_names_found
-
-    # --- Intent 3: Handle general "Top X" questions ---
-    trigger_words = ['top', 'most', 'best', 'cheapest', 'worst']
+    # --- Intent 3: Handle general "Top X" and fixture-based questions ---
+    trigger_words = ['top', 'most', 'best', 'cheapest', 'worst', 'easiest', 'hardest']
     if any(word in question_lower for word in trigger_words):
-        top_x_match = re.search(r'top (\d+)', question_lower)
-        limit = int(top_x_match.group(1)) if top_x_match else 5
+        limit_match = re.search(r'(\d+)', question_lower)
+        limit = int(limit_match.group(1)) if limit_match else 5
         
+        # Fixture-based query
+        if 'fixture' in question_lower or 'gw' in question_lower:
+            team_data = all_players_df[['team_name', 'avg_fixture_difficulty', 'fixture_details']].drop_duplicates(subset=['team_name'])
+            ascending = 'easy' in question_lower or 'best' in question_lower
+            sorted_teams = team_data.sort_values(by='avg_fixture_difficulty', ascending=ascending).head(limit)
+            
+            title = f"Top {limit} Teams with {'Easiest' if ascending else 'Hardest'} Opening Fixtures"
+            summary = f"\n--- {title} ---\n"
+            for _, team in sorted_teams.iterrows():
+                fixtures_str = ", ".join([f"{f['opponent']} ({'H' if f['is_home'] else 'A'})" for f in team['fixture_details']])
+                summary += f"- {full_team_names.get(team['team_name'])} (Avg Diff: {team['avg_fixture_difficulty']}): {fixtures_str}\n"
+            return summary, []
+
+        # Player-based "Top X" query
         df_filtered = all_players_df.copy()
         _, pos_found_code = _find_team_and_position(question_lower, full_team_names)
         pos_found_str = pos_found_code or 'Players'
+        if pos_found_code: df_filtered = df_filtered[df_filtered['position'] == pos_found_code]
 
-        if pos_found_code:
-            df_filtered = df_filtered[df_filtered['position'] == pos_found_code]
-
-        sort_by = 'now_cost'
-        ascending = False
-        metric_str = "Most Expensive"
-        if "cheap" in question_lower:
-            ascending = True
-            metric_str = "Cheapest"
-        elif "selected" in question_lower or "ownership" in question_lower:
-            sort_by = 'selected_by_percent'
-            metric_str = "Most Selected"
-        elif "form" in question_lower:
-            sort_by = 'form'
-            metric_str = "Best Form"
-
-        df_filtered[sort_by] = pd.to_numeric(df_filtered[sort_by], errors='coerce')
+        sort_by, metric_str, ascending = ('now_cost', "Most Expensive", False)
+        if "cheap" in question_lower: metric_str, ascending = "Cheapest", True
+        elif "selected" in question_lower: sort_by, metric_str = 'selected_by_percent', "Most Selected"
+        elif "form" in question_lower: sort_by, metric_str = 'form', "Best Form"
         
+        df_filtered[sort_by] = pd.to_numeric(df_filtered[sort_by], errors='coerce')
         top_players = df_filtered.sort_values(by=sort_by, ascending=ascending).head(limit)
         
         title = f"Top {limit} {metric_str} {pos_found_str}"
         summary = f"\n--- {title} ---\n"
         for _, player in top_players.iterrows():
             value = player[sort_by]
-            if sort_by == 'now_cost':
-                summary += f"- {player.name} ({player.team_name}, {player.position}) - £{value/10.0:.1f}m\n"
-            else:
-                summary += f"- {player.name} ({player.team_name}, {player.position}) - {value}\n"
-            
+            display_val = f"£{value/10.0:.1f}m" if sort_by == 'now_cost' else value
+            summary += f"- {player.name} ({player.team_name}, {player.position}) - {display_val}\n"
         return summary, []
 
     return "", []
@@ -337,42 +325,18 @@ async def stream_chat_response(request: ChatRequest):
         yield "Sorry, the FPL data is not available. The server may still be initializing. Please try again in a moment."
         return
 
-    player_ids = []
-    user_notes = ""
-
-    if is_game_live:
-        try:
-            async with httpx.AsyncClient() as client:
-                picks_url = FPL_API_TEAM_PICKS.format(team_id=request.team_id, gameweek=current_gameweek_id)
-                picks_res = await client.get(picks_url)
-                if picks_res.status_code == 200:
-                    player_ids = [pick['element'] for pick in picks_res.json().get('picks', [])]
-                elif picks_res.status_code == 404:
-                    user_notes += "(Note: Could not fetch your team.)\n"
-                else:
-                    user_notes += "(Note: There was a temporary issue fetching your FPL team.)\n"
-        except Exception as e:
-            print(f"Error fetching picks: {e}")
-            user_notes += "(Note: An unexpected error occurred while fetching your FPL team.)\n"
-    else:
-        user_notes += "(Note: The FPL game is in pre-season, so I can't fetch your team.)\n"
-
     try:
-        full_conversation = " ".join([h.text for h in request.history if h.role == 'user']) + " " + request.question
-        general_summary, players_from_question = build_context_for_question(full_conversation, master_fpl_data, app.state.full_team_names)
+        full_conversation_text = " ".join([h.text for h in request.history]) + " " + request.question
+        general_summary, players_from_question = build_context_for_question(full_conversation_text, master_fpl_data, app.state.full_team_names)
         
-        players_from_team = master_fpl_data[master_fpl_data['id'].isin(player_ids)].index.tolist()
-        all_player_names = sorted(list(set(players_from_team + players_from_question)))
-
-        context_block = f"\n--- Player Analysis ---\n{user_notes}\n"
-        if all_player_names:
+        context_block = ""
+        if players_from_question:
             master_fpl_data['upcoming_fixtures'] = master_fpl_data['fixture_details'].apply(
                 lambda details: ", ".join([f"{f['opponent']} ({'H' if f['is_home'] else 'A'}) [{f['difficulty']}]" for f in details]) if isinstance(details, list) else ""
             )
-            if len(all_player_names) > 1 and not players_from_team:
+            if len(players_from_question) > 1:
                  context_block += "Found multiple players matching your query. Here is the data for all of them:\n\n"
-
-            for name in all_player_names:
+            for name in players_from_question:
                 if name in master_fpl_data.index:
                     player = master_fpl_data.loc[name]
                     context_block += f"**{player.name}** ({player.team_name})\n"
@@ -382,8 +346,8 @@ async def stream_chat_response(request: ChatRequest):
         elif general_summary:
             context_block = general_summary
         else:
-            context_block += "I couldn't find specific data for your query. Please try rephrasing your question."
-        
+            context_block = "I couldn't find specific data for your query. Please try rephrasing your question."
+
         if not is_game_live:
             system_instruction = """
             **IMPORTANT: You are in PRE-SEASON mode.**
@@ -404,13 +368,11 @@ async def stream_chat_response(request: ChatRequest):
             4.  **Price and Ownership:** Use these to assess value and risk.
             """
         
-        # --- FIX: Map 'bot' role to 'model' for the Gemini API ---
         gemini_history = []
         for h in request.history:
             role = "model" if h.role == "bot" else "user"
             gemini_history.append({"role": role, "parts": [{"text": h.text}]})
         gemini_history.append({"role": "user", "parts": [{"text": request.question}]})
-        # --- END OF FIX ---
 
         prompt = f"""
         You are "FPL Brain", an expert FPL analyst.
@@ -428,7 +390,6 @@ async def stream_chat_response(request: ChatRequest):
         model = genai.GenerativeModel('gemini-2.0-flash', system_instruction=prompt)
         chat = model.start_chat(history=gemini_history[:-1])
         response_stream = await chat.send_message_async(gemini_history[-1]['parts'], stream=True)
-
 
         async for chunk in response_stream:
             if chunk.text:
