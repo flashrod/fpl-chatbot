@@ -60,14 +60,6 @@ async def load_and_process_all_data():
     bootstrap_data = bootstrap_res.json()
     fixtures_data = fixtures_res.json()
     
-    # --- DEBUGGING: Print a sample of the raw player data from the API ---
-    print("\n--- DEBUG: Sample Raw Player Data from FPL API ---")
-    if bootstrap_data.get('elements'):
-        print(json.dumps(bootstrap_data['elements'][0], indent=2))
-    else:
-        print("No 'elements' key found in bootstrap data.")
-    # --- END DEBUGGING ---
-
     is_game_live = any(gw.get('is_current', False) for gw in bootstrap_data['events'])
     current_gameweek_id = next((gw['id'] for gw in bootstrap_data['events'] if gw.get('is_current', False)), 1)
     print(f"ℹ️ FPL game live status: {is_game_live}. Current GW: {current_gameweek_id}")
@@ -79,24 +71,6 @@ async def load_and_process_all_data():
     fpl_players_df['team_name'] = fpl_players_df['team'].map(teams_map)
     fpl_players_df['position'] = fpl_players_df['element_type'].map(position_map)
     fpl_players_df = fpl_players_df.rename(columns={'web_name': 'Player'})
-    
-    # --- DEBUGGING: Check player names as they appear in the DataFrame ---
-    print("\n--- DEBUG: Checking for 'Salah' in Player Names from API ---")
-    salah_in_df = 'Salah' in fpl_players_df['Player'].values
-    print(f"Is 'Salah' an exact match in the 'Player' column? -> {salah_in_df}")
-    if not salah_in_df:
-        print("Could not find exact match for 'Salah'. Searching for partial match...")
-        salah_partial = fpl_players_df[fpl_players_df['Player'].str.contains("Salah", case=False)]
-        if not salah_partial.empty:
-            print("Found partial match(es):")
-            print(salah_partial[['Player', 'team_name']].to_dict('records'))
-        else:
-            print("Could not find any partial match for 'Salah' either.")
-            print("First 20 player names from API for review:")
-            print(fpl_players_df['Player'].head(20).tolist())
-    print("--- END DEBUGGING ---\n")
-    # --- END DEBUGGING ---
-
 
     fixtures_df = pd.DataFrame(fixtures_data)
     upcoming_fixtures_data = {}
@@ -265,9 +239,19 @@ async def stream_chat_response(request: ChatRequest):
     try:
         player_names = master_fpl_data[master_fpl_data['id'].isin(player_ids)].index.tolist()
 
+        # --- NEW: More Robust Player Name Matching Logic ---
+        question_words = set(request.question.lower().replace("'", "").replace("’", "").split())
         for name in master_fpl_data.index:
-            if isinstance(name, str) and name.lower() in request.question.lower() and name not in player_names:
-                player_names.append(name)
+            if isinstance(name, str):
+                player_name_lower = name.lower()
+                # Check if any significant word from the question is part of the player's name
+                for word in question_words:
+                    if len(word) > 3 and word in player_name_lower:
+                        if name not in player_names:
+                            player_names.append(name)
+                        break # Move to the next player once matched
+        # --- END of new logic ---
+
 
         context_block = f"\n\n--- Player Analysis ---\n{user_notes}\n"
         master_fpl_data['upcoming_fixtures'] = master_fpl_data['fixture_details'].apply(
@@ -291,7 +275,6 @@ async def stream_chat_response(request: ChatRequest):
                 fixture_context = f"  - **Upcoming Fixtures:** {player.upcoming_fixtures}\n"
                 context_block += fpl_context + fbref_context + fixture_context
         
-        # --- NEW: More Forceful and Specific Prompt Instructions ---
         if not is_game_live:
             system_instruction = """
             **IMPORTANT: You are in PRE-SEASON mode.**
