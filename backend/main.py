@@ -72,19 +72,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Pydantic Models ---
+# (Pydantic Models remain the same)
 class ChatRequest(BaseModel):
     team_id: int
     question: str
-
 class Player(BaseModel):
     name: str
     position: str
     cost: float
-    team_name: str
-    team_shirt_color: str
-    team_shirt_sleeve_color: str
-
 class TeamData(BaseModel):
     team_id: int
     gameweek: int
@@ -160,10 +155,7 @@ async def get_team_data(team_id: int):
                         players.append(Player(
                             name=player_info['web_name'],
                             position=position_map.get(player_info['element_type']),
-                            cost=player_info['now_cost'] / 10.0,
-                            team_name=team_info['short_name'] if team_info else 'N/A',
-                            team_shirt_color=team_info.get('team_shirt_colour', '#ffffff'),
-                            team_shirt_sleeve_color=team_info.get('team_shirt_sleeve_colour', '#000000')
+                            cost=player_info['now_cost'] / 10.0
                         ))
 
         return TeamData(team_id=team_id, gameweek=current_gameweek, players=players)

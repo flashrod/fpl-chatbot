@@ -3,9 +3,6 @@
 from typing import Dict, List, Any
 
 def identify_double_gameweeks(fixtures: List[Dict], current_gw: int) -> Dict[int, Dict[int, int]]:
-    """
-    Identifies gameweeks where teams play multiple times.
-    """
     team_fixtures_by_gw = {}
     future_fixtures = [f for f in fixtures if f.get("event") is not None and f["event"] >= current_gw]
     
@@ -23,9 +20,6 @@ def identify_double_gameweeks(fixtures: List[Dict], current_gw: int) -> Dict[int
     return team_fixtures_by_gw
 
 def calculate_gameweek_difficulty(gw: int, team_fixtures_in_gw: Dict[int, int], all_fixtures: List[Dict], teams_map: Dict[int, Any]) -> Dict:
-    """
-    Calculates the difficulty of a single gameweek for chip usage.
-    """
     gw_fixtures = [f for f in all_fixtures if f.get("event") == gw]
     
     team_difficulties = {}
@@ -45,7 +39,8 @@ def calculate_gameweek_difficulty(gw: int, team_fixtures_in_gw: Dict[int, int], 
     double_gw_teams = {tid: count for tid, count in team_fixtures_in_gw.items() if count > 1}
     avg_difficulty = sum(team_avg_difficulty.values()) / len(team_avg_difficulty) if team_avg_difficulty else 3
     
-    difficulty_score = (avg_difficulty * 0.3) - (len(double_gw_teams) * 5)
+    # Your composite score logic
+    difficulty_score = (avg_difficulty * 0.3) - (len(double_gw_teams) * 0.7 * 10)
     
     return {
         "gameweek": gw,
@@ -54,60 +49,7 @@ def calculate_gameweek_difficulty(gw: int, team_fixtures_in_gw: Dict[int, int], 
         "avg_fixture_difficulty": round(avg_difficulty, 2),
     }
 
-def get_recommended_players(live_data: Dict[str, Any], position_filter: int = None, limit: int = 10) -> List[Dict]:
-    """
-    Gets player recommendations based on form, fixture difficulty, and total points.
-    """
-    players = live_data["bootstrap"]["elements"]
-    if position_filter:
-        players = [p for p in players if p.get("element_type") == position_filter]
-
-    position_map = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
-    teams_map = {team['id']: team for team in live_data["bootstrap"]["teams"]}
-
-    player_scores = []
-    for player in players:
-        team_id = player.get("team")
-        form = float(player.get("form", 0.0))
-        points = player.get("total_points", 0)
-        minutes = player.get("minutes", 0)
-        
-        if minutes < 500:
-            continue
-
-        team_info = teams_map.get(team_id)
-        if not team_info:
-            continue
-            
-        team_short_name = team_info.get('short_name')
-        if not team_short_name:
-            continue
-        
-        upcoming_fixtures_text = live_data.get('upcoming_fixtures', {}).get(team_short_name, [])
-        
-        try:
-            avg_difficulty = sum([int(f.split('[')[1].split(']')[0]) for f in upcoming_fixtures_text]) / len(upcoming_fixtures_text) if upcoming_fixtures_text else 3
-        except (IndexError, ValueError):
-            avg_difficulty = 3
-
-        score = (form * 3) + ((5 - avg_difficulty) * 1.5) + (points / 20)
-        
-        player_scores.append({
-            "name": player["web_name"],
-            "team": team_info["name"],
-            "position": position_map.get(player["element_type"]),
-            "price": player.get("now_cost", 0) / 10.0,
-            "form": form,
-            "points": points,
-            "score": round(score, 2)
-        })
-
-    return sorted(player_scores, key=lambda x: x["score"], reverse=True)[:limit]
-
 async def calculate_chip_recommendations(live_data: Dict[str, Any], number_of_recommendations: int = 3) -> Dict:
-    """
-    Calculates and recommends optimal gameweeks for using FPL chips.
-    """
     try:
         bootstrap_data = live_data["bootstrap"]
         all_fixtures = live_data["all_fixtures"]
