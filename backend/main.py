@@ -1,22 +1,16 @@
-# backend/main.py
-
 import os
 import httpx
 import google.generativeai as genai
 import asyncio
-import json
+import pandas as pd
 from pathlib import Path
-import numpy as np
-import faiss
-from sentence_transformers import SentenceTransformer
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from dotenv import load_dotenv
-from cachetools import TTLCache
 from fastapi.responses import StreamingResponse
-
-import chip_service
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 # --- Configuration ---
 load_dotenv()
@@ -30,39 +24,86 @@ FPL_API_BOOTSTRAP = "https://fantasy.premierleague.com/api/bootstrap-static/"
 FPL_API_FIXTURES = "https://fantasy.premierleague.com/api/fixtures/"
 FPL_API_TEAM_PICKS = "https://fantasy.premierleague.com/api/entry/{team_id}/event/{gameweek}/picks/"
 DATA_DIR = Path(__file__).parent / "fpl_data"
-PROCESSED_DATA_PATH = DATA_DIR / "processed_player_data.json"
-FAISS_INDEX_PATH = DATA_DIR / "player_data.index"
+FBREF_STATS_PATH = DATA_DIR / "fbref_player_stats.csv"
 
 # --- In-Memory Stores ---
-fpl_live_data_cache = TTLCache(maxsize=1, ttl=3600)
-historical_data_store = {}
-vector_index = None
-embedding_model = None
-player_id_map = {}
+master_fpl_data = None
+current_gameweek_id = None
+# CHANGE 1: Add a flag to track if the FPL game is live
+is_game_live = False
+scheduler = AsyncIOScheduler()
 
-# --- FastAPI App Initialization & Events ---
+# --- FastAPI App ---
 app = FastAPI(title="FPL AI Chatbot API")
 
+# --- Core Data Processing ---
+
+async def load_and_process_all_data():
+    """
+    The main data processing function. Fetches from FPL API and FBref,
+    then merges them into a single master DataFrame.
+    """
+    global master_fpl_data, current_gameweek_id, is_game_live
+    print("🔄 Starting data update process...")
+
+    async with httpx.AsyncClient() as client:
+        bootstrap_task = client.get(FPL_API_BOOTSTRAP)
+        fixtures_task = client.get(FPL_API_FIXTURES)
+        bootstrap_res, fixtures_res = await asyncio.gather(bootstrap_task, fixtures_task)
+
+    if bootstrap_res.status_code != 200 or fixtures_res.status_code != 200:
+        print("❌ Failed to fetch live FPL data. Aborting update.")
+        return
+
+    bootstrap_data = bootstrap_res.json()
+    fixtures_data = fixtures_res.json()
+
+    # CHANGE 2: Determine if any gameweek is 'current'
+    is_game_live = any(gw.get('is_current', False) for gw in bootstrap_data['events'])
+    current_gameweek_id = next((gw['id'] for gw in bootstrap_data['events'] if gw.get('is_current', False)), 1)
+    print(f"ℹ️ FPL game live status: {is_game_live}. Current GW: {current_gameweek_id}")
+
+    # (The rest of the data processing remains the same)
+    teams_map = {team['id']: team['short_name'] for team in bootstrap_data['teams']}
+    fpl_players_df = pd.DataFrame(bootstrap_data['elements'])
+    fpl_players_df['team_name'] = fpl_players_df['team'].map(teams_map)
+    fpl_players_df = fpl_players_df.rename(columns={'web_name': 'Player'})
+    fixtures_df = pd.DataFrame(fixtures_data)
+    upcoming_fixtures = {}
+    for team_id in teams_map.keys():
+        team_fixtures = fixtures_df[((fixtures_df['team_h'] == team_id) | (fixtures_df['team_a'] == team_id)) & (fixtures_df['event'] >= current_gameweek_id)]
+        fixture_strings = []
+        for _, row in team_fixtures.head(5).iterrows():
+            opponent = teams_map[row['team_a']] if row['team_h'] == team_id else teams_map[row['team_h']]
+            venue = "(H)" if row['team_h'] == team_id else "(A)"
+            difficulty = row['team_h_difficulty'] if row['team_h'] == team_id else row['team_a_difficulty']
+            fixture_strings.append(f"{opponent} {venue} [{difficulty}]")
+        upcoming_fixtures[team_id] = ", ".join(fixture_strings)
+    fpl_players_df['upcoming_fixtures'] = fpl_players_df['team'].map(upcoming_fixtures)
+    
+    if not FBREF_STATS_PATH.exists():
+        print("❌ FBref stats file not found. Run data_pipeline.py first. Aborting update.")
+        return
+    fbref_df = pd.read_csv(FBREF_STATS_PATH)
+    fpl_players_df['Player_lower'] = fpl_players_df['Player'].str.lower()
+    fbref_df['Player_lower'] = fbref_df['Player'].str.lower()
+    merged_df = pd.merge(fpl_players_df, fbref_df, on='Player_lower', how='left')
+    merged_df.set_index('Player_x', inplace=True)
+    master_fpl_data = merged_df
+    print("✅ Data update complete. Master DataFrame created.")
+
+# (Startup/Shutdown events remain the same)
 @app.on_event("startup")
-def load_data_and_models():
-    global historical_data_store, vector_index, embedding_model, player_id_map
-    if PROCESSED_DATA_PATH.exists():
-        with open(PROCESSED_DATA_PATH, 'r', encoding='utf-8') as f:
-            historical_data_store = json.load(f)
-        player_id_map = {i: name for i, name in enumerate(historical_data_store.keys())}
-        print("✅ Historical data loaded.")
-    else:
-        print("⚠️ Historical data file not found.")
+async def startup_event():
+    await load_and_process_all_data()
+    scheduler.add_job(load_and_process_all_data, IntervalTrigger(days=3))
+    scheduler.start()
+    print("🚀 Server started and data refresh scheduler is running.")
 
-    print("Loading sentence transformer model...")
-    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-    print("✅ Embedding model loaded.")
-
-    if FAISS_INDEX_PATH.exists():
-        vector_index = faiss.read_index(str(FAISS_INDEX_PATH))
-        print("✅ FAISS index loaded.")
-    else:
-        print("⚠️ FAISS index not found. RAG will not be available.")
+@app.on_event("shutdown")
+def shutdown_event():
+    scheduler.shutdown()
+    print("👋 Scheduler shut down.")
 
 app.add_middleware(
     CORSMiddleware,
@@ -72,192 +113,87 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# (Pydantic Models remain the same)
 class ChatRequest(BaseModel):
     team_id: int
     question: str
-class Player(BaseModel):
-    name: str
-    position: str
-    cost: float
-class TeamData(BaseModel):
-    team_id: int
-    gameweek: int
-    players: list[Player]
-
-# --- Helper Functions ---
-
-async def get_live_fpl_data():
-    if 'live_data' in fpl_live_data_cache:
-        return fpl_live_data_cache['live_data']
-    
-    print("CACHE MISS: Fetching new live data from FPL API.")
-    async with httpx.AsyncClient() as client:
-        bootstrap_task = client.get(FPL_API_BOOTSTRAP)
-        fixtures_task = client.get(FPL_API_FIXTURES)
-        bootstrap_res, fixtures_res = await asyncio.gather(bootstrap_task, fixtures_task)
-        
-        bootstrap_data = bootstrap_res.json()
-        fixtures_data = fixtures_res.json()
-
-        teams_map = {team['id']: team for team in bootstrap_data['teams']}
-        
-        player_details = {p['id']: {'name': p['web_name'], 'team_id': p['team'], 'status': p['status'], 'news': p['news'], 'form': p['form']} for p in bootstrap_data['elements']}
-        
-        upcoming_fixtures = {}
-        current_gameweek = next((gw['id'] for gw in bootstrap_data['events'] if gw['is_current']), None)
-        if current_gameweek:
-            for team_id_num in teams_map:
-                team_fixtures = [
-                    f"{teams_map[f['team_a']]['short_name']} (A) [{f.get('team_a_difficulty', 3)}]" if f.get('team_h') != team_id_num else f"{teams_map[f['team_h']]['short_name']} (H) [{f.get('team_h_difficulty', 3)}]"
-                    for f in fixtures_data 
-                    if f.get('event') and f.get('team_h') and f.get('team_a') and (f['team_h'] == team_id_num or f['team_a'] == team_id_num) and f['event'] >= current_gameweek
-                ]
-                upcoming_fixtures[teams_map[team_id_num]['short_name']] = team_fixtures[:3]
-
-        live_data = {
-            "bootstrap": bootstrap_data,
-            "all_fixtures": fixtures_data,
-            "player_details": player_details,
-            "upcoming_fixtures": upcoming_fixtures
-        }
-        fpl_live_data_cache['live_data'] = live_data
-        return live_data
-
-@app.get("/api/get-team-data/{team_id}", response_model=TeamData)
-async def get_team_data(team_id: int):
-    try:
-        live_data = await get_live_fpl_data()
-        bootstrap_data = live_data['bootstrap']
-        
-        current_gameweek = next((gw['id'] for gw in bootstrap_data['events'] if gw['is_current']), 1)
-        
-        player_map = {p['id']: p for p in bootstrap_data['elements']}
-        position_map = {p_type['id']: p_type['singular_name_short'] for p_type in bootstrap_data['element_types']}
-        teams_map = {t['id']: t for t in bootstrap_data['teams']}
-        
-        team_picks_url = FPL_API_TEAM_PICKS.format(team_id=team_id, gameweek=current_gameweek)
-        
-        players = []
-        async with httpx.AsyncClient() as client:
-            entry_res = await client.get(f"https://fantasy.premierleague.com/api/entry/{team_id}/")
-            if entry_res.status_code != 200:
-                raise HTTPException(status_code=404, detail=f"FPL Team ID {team_id} not found.")
-
-            picks_res = await client.get(team_picks_url)
-            
-            if picks_res.status_code == 200:
-                picks_data = picks_res.json()
-                for pick in picks_data.get('picks', []):
-                    player_info = player_map.get(pick['element'])
-                    if player_info:
-                        team_info = teams_map.get(player_info['team'])
-                        players.append(Player(
-                            name=player_info['web_name'],
-                            position=position_map.get(player_info['element_type']),
-                            cost=player_info['now_cost'] / 10.0
-                        ))
-
-        return TeamData(team_id=team_id, gameweek=current_gameweek, players=players)
-
-    except HTTPException as http_exc:
-        raise http_exc
-    except Exception as e:
-        print(f"Error in get_team_data: {e}")
-        raise HTTPException(status_code=500, detail="An unexpected server error occurred.")
-
 
 # --- API Endpoints ---
-@app.get("/api/chip-recommendations")
-async def get_chip_recommendations():
-    live_data = await get_live_fpl_data()
-    return await chip_service.calculate_chip_recommendations(live_data)
-
-@app.get("/api/player-recommendations")
-async def get_player_recommendations(position: int = None):
-    live_data = await get_live_fpl_data()
-    return chip_service.get_recommended_players(live_data, position_filter=position, limit=10)
-
 async def stream_chat_response(request: ChatRequest):
+    if master_fpl_data is None:
+        yield "Sorry, the FPL data is not available. The server may still be initializing. Please try again in a moment."
+        return
+
+    player_ids = []
+    user_notes = "" # A place to store messages for the user
+
+    # CHANGE 3: Graceful handling of team pick fetching
+    if is_game_live:
+        try:
+            async with httpx.AsyncClient() as client:
+                picks_url = FPL_API_TEAM_PICKS.format(team_id=request.team_id, gameweek=current_gameweek_id)
+                picks_res = await client.get(picks_url)
+                if picks_res.status_code == 200:
+                    player_ids = [pick['element'] for pick in picks_res.json().get('picks', [])]
+                elif picks_res.status_code == 404:
+                    user_notes += "(Note: Could not fetch your team. The Team ID might be incorrect or you haven't picked a team for this gameweek yet.)\n"
+                else:
+                    # For other errors like 500, 503, etc.
+                    user_notes += "(Note: There was a temporary issue fetching your FPL team.)\n"
+        except Exception as e:
+            print(f"Error fetching picks: {e}")
+            user_notes += "(Note: An unexpected error occurred while fetching your FPL team.)\n"
+    else:
+        user_notes += "(Note: The FPL game is currently between seasons, so I can't fetch your team. You can still ask general player questions.)\n"
+
+    # Now, the code continues gracefully even if picks failed
     try:
-        team_data = await get_team_data(request.team_id)
-        live_data = await get_live_fpl_data()
-
-        context_players = set()
-        if vector_index and embedding_model:
-            question_embedding = embedding_model.encode([request.question])
-            k = 3
-            _, indices = vector_index.search(question_embedding, k)
-            for i in indices[0]:
-                if i != -1:
-                    player_name = player_id_map.get(i)
-                    if player_name:
-                        context_players.add(player_name)
+        player_names = master_fpl_data[master_fpl_data['id'].isin(player_ids)].index.tolist()
         
-        for player in team_data.players:
-            context_players.add(player.name)
+        # Add players from the question itself for general queries
+        for name in master_fpl_data.index:
+            if isinstance(name, str) and name.lower() in request.question.lower() and name not in player_names:
+                player_names.append(name)
 
-        context_block = ""
-        if context_players:
-            context_block += "\n\n--- CONTEXTUAL DATA ---\n"
-            for name in sorted(list(context_players)):
-                context_block += f"Player: **{name}**\n"
-                player_id = next((pid for pid, pdata in live_data['player_details'].items() if pdata['name'] == name), None)
-                if player_id:
-                    details = live_data['player_details'][player_id]
-                    team_id_num = details.get('team_id')
-                    if team_id_num:
-                        team_name = next((t['short_name'] for t in live_data['bootstrap']['teams'] if t['id'] == team_id_num), None)
-                        if team_name:
-                            context_block += (f"* **Live Status:** Form: {details.get('form', 'N/A')}, "
-                                              f"Injury: {details.get('news', 'Available') or 'Available'}\n")
-                            context_block += f"* **Upcoming Fixtures for {team_name}:** {', '.join(live_data['upcoming_fixtures'].get(team_name, ['N/A']))}\n"
-                if name in historical_data_store:
-                    context_block += f"* **Historical Note:** {json.dumps(historical_data_store[name])}\n"
-            context_block += "-----------------------\n"
+        context_block = f"\n\n--- Player Analysis ---\n{user_notes}\n"
+        for name in sorted(list(set(player_names))):
+            if name in master_fpl_data.index:
+                player = master_fpl_data.loc[name]
+                context_block += f"**{player.name}** ({player.team_name})\n"
+                fpl_context = f"  - **FPL Status:** Price: £{player.now_cost/10.0:.1f}, Form: {player.form}, Selected: {player.selected_by_percent}%, News: {player.news or 'Available'}\n"
+                fbref_context = f"  - **Season Stats:** Mins: {int(player.get('Min_standard', 0))}, xG: {round(player.get('xG_shooting', 0), 2)}, xAG: {round(player.get('xAG_shooting', 0), 2)}, SCA: {int(player.get('SCA_gca', 0))}\n"
+                fixture_context = f"  - **Upcoming Fixtures:** {player.upcoming_fixtures}\n"
+                context_block += fpl_context + fbref_context + fixture_context
 
+        # (The prompt remains the same)
         prompt = f"""
-        You are "FPL AI", a world-class Fantasy Premier League analyst. Your tone is insightful, data-driven, and slightly witty.
-        Your task is to answer the user's question based on all the data provided.
+        You are "FPL Brain", the world's most advanced Fantasy Premier League analyst. You have access to a complete dataset combining live FPL data and deep performance stats.
+        Your task is to provide expert advice by synthesizing all available information.
 
-        **Reasoning Hierarchy (IMPORTANT):**
-        1.  **Prioritize Live Data:** Your primary analysis MUST be based on current form, injury status, and upcoming fixtures. This is the most critical information.
-        2.  **Consider User's Team:** Analyze the players the user actually owns.
-        3.  **Use Historical Data as Secondary Context:** Only use historical data to support your analysis of current form (e.g., "he has a history of performing well in the final gameweeks") or if the question is specifically about the past. Do NOT base your primary recommendation on historical data.
-
-        **Response Rules:**
-        * **Structure:**
-            1.  **Assessment:** Start with a one-sentence summary of the situation.
-            2.  **Key Insights:** Use a bulleted list (*) to present the most important points from your analysis.
-            3.  **Recommendation:** End with a clear, actionable recommendation.
-        * **Formatting:** Use Markdown. Use **bold** for player names and key terms.
-        * **Conciseness:** Be direct. Do not repeat information or use filler phrases.
-        * **Honesty:** If the data is insufficient, state it clearly and suggest where the user can find the information they need (e.g., "For the latest team news, check Fantasy Football Scout.").
+        **Reasoning Hierarchy:**
+        1.  **Availability is Key:** If a player has injury **News**, this is the most important factor.
+        2.  **Fixtures Drive Short-Term Decisions:** Use the **Upcoming Fixtures** (with difficulty scores) to recommend immediate transfers. Easy fixtures are a huge plus.
+        3.  **Underlying Stats (xG/xAG) Predict Future Returns:** Use a player's **Season Stats** to determine if their FPL **Form** is sustainable. A player with high xG and low Form is a great target. A player with high Form but low xG might be getting lucky.
+        4.  **Price and Ownership as Context:** Use **Price** and **Selected By %** to assess value and risk. A cheap, low-ownership player with good stats and fixtures is a differential gem.
+        5.  **Acknowledge Missing Data:** If you see a note about not being able to fetch the user's team, incorporate that into your answer gracefully.
 
         ---
         **User's Question:** "{request.question}"
         
-        **User's Team Data:**
-        {team_data.model_dump_json(indent=2)}
-
-        **Contextual Data:**
-        {context_block if context_block else "No specific context was found to be relevant to the user's question."}
+        **Analysis of User's Players:**
+        {context_block}
         ---
         
-        Now, provide your expert analysis.
+        Now, provide your expert, multi-faceted FPL recommendation.
         """
 
         model = genai.GenerativeModel('gemini-1.5-flash')
         response_stream = await model.generate_content_async(prompt, stream=True)
-
         async for chunk in response_stream:
             if chunk.text:
                 yield chunk.text
-                await asyncio.sleep(0.02) 
-
     except Exception as e:
         print(f"Error during chat streaming: {e}")
-        yield "Sorry, I encountered an error. Please try again."
+        yield "Sorry, I encountered a critical error. Please try again."
 
 @app.post("/api/chat")
 async def chat_with_bot(request: ChatRequest):
