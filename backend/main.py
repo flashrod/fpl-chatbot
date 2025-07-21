@@ -3,8 +3,8 @@ import httpx
 import asyncio
 import pandas as pd
 from pathlib import Path
-from typing import List
-import json
+from typing import List, Tuple
+import re
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -206,6 +206,67 @@ async def get_team_data(team_id: int):
         print(f"Error in get_team_data: {e}")
         raise HTTPException(status_code=500, detail="An unexpected server error occurred.")
 
+# --- NEW: Intelligent Context Builder ---
+def build_context_for_question(question: str, all_players_df: pd.DataFrame) -> Tuple[str, List[str]]:
+    """
+    Analyzes the user's question to build the most relevant context for the AI.
+    """
+    question_lower = question.lower()
+    player_names_found = []
+    
+    # 1. Find specific player names mentioned
+    question_words = set(question_lower.replace("'", "").replace("’", "").split())
+    for name in all_players_df.index:
+        if isinstance(name, str):
+            for word in question_words:
+                if len(word) > 3 and any(part.startswith(word) for part in name.lower().split()):
+                    if name not in player_names_found:
+                        player_names_found.append(name)
+                    break
+    
+    if player_names_found:
+        return "", player_names_found # Return just the names for specific player questions
+
+    # 2. Handle general "Top X" questions if no specific player is found
+    # Regex to find patterns like "top 3", "top 5", "most expensive"
+    top_x_match = re.search(r'top (\d+)', question_lower)
+    limit = int(top_x_match.group(1)) if top_x_match else 5 # Default to top 5
+
+    position_map = {
+        'defenders': 'DEF', 'defender': 'DEF',
+        'midfielders': 'MID', 'midfielder': 'MID',
+        'forwards': 'FWD', 'forward': 'FWD',
+        'goalkeepers': 'GKP', 'goalkeeper': 'GKP'
+    }
+    
+    df_filtered = all_players_df.copy()
+    
+    # Filter by position
+    pos_found = None
+    for pos_str, pos_code in position_map.items():
+        if pos_str in question_lower:
+            df_filtered = df_filtered[df_filtered['position'] == pos_code]
+            pos_found = pos_str
+            break
+
+    # Determine sorting metric (cost, form, etc.)
+    sort_by = 'now_cost'
+    ascending = False
+    metric_str = "Most Expensive"
+    if "cheap" in question_lower:
+        ascending = True
+        metric_str = "Cheapest"
+    
+    # Generate the context summary
+    top_players = df_filtered.sort_values(by=sort_by, ascending=ascending).head(limit)
+    
+    title = f"Top {limit} {metric_str} {pos_found or 'Players'}"
+    summary = f"\n--- {title} ---\n"
+    for _, player in top_players.iterrows():
+        summary += f"- {player.name} ({player.team_name}, {player.position}) - £{player.now_cost/10.0:.1f}m\n"
+        
+    return summary, []
+
 
 @app.post("/api/chat")
 async def chat_with_bot(request: ChatRequest):
@@ -237,63 +298,47 @@ async def stream_chat_response(request: ChatRequest):
         user_notes += "(Note: The FPL game is currently in pre-season, so I can't fetch your specific team. You can still ask general player questions.)\n"
 
     try:
-        player_names = master_fpl_data[master_fpl_data['id'].isin(player_ids)].index.tolist()
+        # Use the new intelligent context builder
+        general_summary, players_from_question = build_context_for_question(request.question, master_fpl_data)
+        
+        players_from_team = master_fpl_data[master_fpl_data['id'].isin(player_ids)].index.tolist()
+        all_player_names = sorted(list(set(players_from_team + players_from_question)))
 
-        # --- NEW: More Robust Player Name Matching Logic ---
-        question_words = set(request.question.lower().replace("'", "").replace("’", "").split())
-        for name in master_fpl_data.index:
-            if isinstance(name, str):
-                player_name_lower = name.lower()
-                # Check if any significant word from the question is part of the player's name
-                for word in question_words:
-                    if len(word) > 3 and word in player_name_lower:
-                        if name not in player_names:
-                            player_names.append(name)
-                        break # Move to the next player once matched
-        # --- END of new logic ---
-
-
-        context_block = f"\n\n--- Player Analysis ---\n{user_notes}\n"
-        master_fpl_data['upcoming_fixtures'] = master_fpl_data['fixture_details'].apply(
-            lambda details: ", ".join([f"{f['opponent']} ({'H' if f['is_home'] else 'A'}) [{f['difficulty']}]" for f in details]) if isinstance(details, list) else ""
-        )
-        for name in sorted(list(set(player_names))):
-            if name in master_fpl_data.index:
-                player = master_fpl_data.loc[name]
-                context_block += f"**{player.name}** ({player.team_name})\n"
-                fpl_context = (
-                    f"  - **FPL Status:** Price: £{player.now_cost/10.0:.1f}, "
-                    f"Form: {player.form}, Selected: {player.selected_by_percent}%, "
-                    f"News: {player.news or 'Available'}\n"
-                )
-                fbref_context = (
-                    f"  - **Season Stats:** Mins: {int(player.get('Min_standard', 0))}, "
-                    f"xG: {round(player.get('xG_shooting', 0), 2)}, "
-                    f"xAG: {round(player.get('xAG_shooting', 0), 2)}, "
-                    f"SCA: {int(player.get('SCA_gca', 0))}\n"
-                )
-                fixture_context = f"  - **Upcoming Fixtures:** {player.upcoming_fixtures}\n"
-                context_block += fpl_context + fbref_context + fixture_context
+        context_block = f"\n--- Player Analysis ---\n{user_notes}\n"
+        if all_player_names:
+            master_fpl_data['upcoming_fixtures'] = master_fpl_data['fixture_details'].apply(
+                lambda details: ", ".join([f"{f['opponent']} ({'H' if f['is_home'] else 'A'}) [{f['difficulty']}]" for f in details]) if isinstance(details, list) else ""
+            )
+            for name in all_player_names:
+                if name in master_fpl_data.index:
+                    player = master_fpl_data.loc[name]
+                    context_block += f"**{player.name}** ({player.team_name})\n"
+                    fpl_context = f"  - **FPL Status:** Price: £{player.now_cost/10.0:.1f}, Selected: {player.selected_by_percent}%\n"
+                    fixture_context = f"  - **Upcoming Fixtures:** {player.upcoming_fixtures}\n"
+                    context_block += fpl_context + fixture_context
+        elif general_summary:
+            context_block = general_summary
+        else:
+            context_block += "No specific player data found relevant to the question."
         
         if not is_game_live:
             system_instruction = """
             **IMPORTANT: You are in PRE-SEASON mode.**
-            Your task is to evaluate a player's value based on the data provided in the "Player Analysis" section.
+            Your task is to answer the user's question based on the data provided in the "Analysis" section.
             
             **Instructions:**
-            1.  Find the player mentioned in the user's question within the "Player Analysis" block.
-            2.  Extract their **Price** from the "FPL Status" line.
-            3.  Extract their team's opening games from the "Upcoming Fixtures" line.
-            4.  Formulate your answer based ONLY on this price and fixture information. Acknowledge that performance stats (xG, goals) are not available yet because no matches have been played.
-            5.  **DO NOT state that you don't have the player's information if they are listed in the data below.** You must use the data provided.
+            1.  If the context provides specific player data (Price, Fixtures), use that to answer the question.
+            2.  If the context provides a general summary (like 'Top 5 Most Expensive Players'), use that list to answer the question.
+            3.  Acknowledge that performance stats (xG, goals) are not available yet.
+            4.  **DO NOT state that you don't have information if it is present in the context.** You must use the data provided.
             """
         else:
             system_instruction = """
             **Reasoning Hierarchy:**
             1.  **Availability is Key:** If a player has injury **News**, this is the most important factor.
-            2.  **Fixtures Drive Short-Term Decisions:** Use the **Upcoming Fixtures** (with difficulty scores) to recommend immediate transfers.
-            3.  **Underlying Stats (xG/xAG) Predict Future Returns:** Use a player's **Season Stats** to determine if their FPL **Form** is sustainable.
-            4.  **Price and Ownership as Context:** Use **Price** and **Selected By %** to assess value and risk.
+            2.  **Fixtures Drive Short-Term Decisions:** Use the **Upcoming Fixtures** to recommend transfers.
+            3.  **Underlying Stats (xG/xAG):** Use these to determine if FPL **Form** is sustainable.
+            4.  **Price and Ownership:** Use these to assess value and risk.
             """
 
         prompt = f"""
