@@ -1,95 +1,149 @@
 # backend/chip_service.py
-import pandas as pd
 
-def get_all_team_fixture_difficulty(master_fpl_data):
+from typing import Dict, List, Any
+
+def identify_double_gameweeks(fixtures: List[Dict], current_gw: int) -> Dict[int, Dict[int, int]]:
     """
-    Reads team fixture data directly from the pre-processed master DataFrame,
-    formats it, and returns a sorted list by average difficulty.
+    Identifies gameweeks where teams play multiple times.
+    """
+    team_fixtures_by_gw = {}
+    future_fixtures = [f for f in fixtures if f.get("event") is not None and f["event"] >= current_gw]
     
-    Args:
-        master_fpl_data: The main DataFrame containing all processed FPL data.
-    """
-    if master_fpl_data is None:
-        return []
-
-    team_data = master_fpl_data[['team_name', 'avg_fixture_difficulty', 'fixture_details']].copy()
-    team_data.dropna(subset=['team_name'], inplace=True)
-    team_data.drop_duplicates(subset=['team_name'], inplace=True)
-
-    difficulty_list = team_data.to_dict(orient='records')
-
-    formatted_list = [
-        {
-            "name": item['team_name'],
-            "avg_difficulty": item['avg_fixture_difficulty'],
-            "fixture_details": item['fixture_details']
-        }
-        for item in difficulty_list
-    ]
-    
-    return sorted(formatted_list, key=lambda x: x['avg_difficulty'])
-
-
-def calculate_chip_recommendations(master_fpl_data):
-    """
-    Analyzes fixture data to recommend opportune moments for using Bench Boost and Triple Captain chips.
-
-    Args:
-        master_fpl_data: The main DataFrame containing all processed FPL data.
-    """
-    if master_fpl_data is None or 'fixture_details' not in master_fpl_data.columns:
-        return {"bench_boost": [], "triple_captain": [], "status": "Data not available."}
-
-    # --- Analyze for Double Gameweeks (for Bench Boost) ---
-    gameweek_counts = {}
-    for index, row in master_fpl_data.iterrows():
-        team_name = row.get('team_name')
-        if not team_name or not isinstance(row['fixture_details'], list):
-            continue
+    for f in future_fixtures:
+        gw = f["event"]
+        if gw not in team_fixtures_by_gw:
+            team_fixtures_by_gw[gw] = {}
         
-        for fixture in row['fixture_details']:
-            gw = fixture['gameweek']
-            if gw not in gameweek_counts:
-                gameweek_counts[gw] = {}
+        home_team, away_team = f.get("team_h"), f.get("team_a")
+        if home_team:
+            team_fixtures_by_gw[gw][home_team] = team_fixtures_by_gw[gw].get(home_team, 0) + 1
+        if away_team:
+            team_fixtures_by_gw[gw][away_team] = team_fixtures_by_gw[gw].get(away_team, 0) + 1
             
-            gameweek_counts[gw][team_name] = gameweek_counts[gw].get(team_name, 0) + 1
+    return team_fixtures_by_gw
 
-    bench_boost_recommendations = []
-    for gw, teams in gameweek_counts.items():
-        double_gw_teams = [team for team, count in teams.items() if count > 1]
-        if len(double_gw_teams) >= 2: # Recommend if at least 2 teams have a double gameweek
-            bench_boost_recommendations.append({
-                "gameweek": gw,
-                "teams_with_multiple_fixtures": ", ".join(double_gw_teams),
-                "avg_fixture_difficulty": "N/A" # This would require more complex calculation
-            })
+def calculate_gameweek_difficulty(gw: int, team_fixtures_in_gw: Dict[int, int], all_fixtures: List[Dict], teams_map: Dict[int, Any]) -> Dict:
+    """
+    Calculates the difficulty of a single gameweek for chip usage.
+    """
+    gw_fixtures = [f for f in all_fixtures if f.get("event") == gw]
+    
+    team_difficulties = {}
+    for fixture in gw_fixtures:
+        home_team, away_team = fixture.get("team_h"), fixture.get("team_a")
+        
+        if away_team:
+            if away_team not in team_difficulties: team_difficulties[away_team] = []
+            team_difficulties[away_team].append(fixture.get("team_h_difficulty", 3))
+        
+        if home_team:
+            if home_team not in team_difficulties: team_difficulties[home_team] = []
+            team_difficulties[home_team].append(fixture.get("team_a_difficulty", 3))
 
-    # --- Analyze for Triple Captain ---
-    # Find players with high form and a very easy single fixture
-    triple_captain_recommendations = []
-    # Sort players by form to find top candidates
-    top_form_players = master_fpl_data.sort_values(by='form', ascending=False).head(20)
+    team_avg_difficulty = {tid: sum(d) / len(d) for tid, d in team_difficulties.items() if d}
+    
+    double_gw_teams = {tid: count for tid, count in team_fixtures_in_gw.items() if count > 1}
+    avg_difficulty = sum(team_avg_difficulty.values()) / len(team_avg_difficulty) if team_avg_difficulty else 3
+    
+    # A simple scoring model: lower is better. Penalize high difficulty, reward double gameweeks.
+    difficulty_score = (avg_difficulty * 0.3) - (len(double_gw_teams) * 5)
+    
+    return {
+        "gameweek": gw,
+        "difficulty_score": round(difficulty_score, 2),
+        "teams_with_multiple_fixtures": len(double_gw_teams),
+        "avg_fixture_difficulty": round(avg_difficulty, 2),
+    }
 
-    for index, player in top_form_players.iterrows():
-        if not isinstance(player['fixture_details'], list) or not player['fixture_details']:
+def get_recommended_players(live_data: Dict[str, Any], position_filter: int = None, limit: int = 10) -> List[Dict]:
+    """
+    Gets player recommendations based on form, fixture difficulty, and total points.
+    """
+    players = live_data["bootstrap"]["elements"]
+    if position_filter:
+        players = [p for p in players if p.get("element_type") == position_filter]
+
+    position_map = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
+    teams_map = {team['id']: team for team in live_data["bootstrap"]["teams"]}
+
+    player_scores = []
+    for player in players:
+        team_id = player.get("team")
+        form = float(player.get("form", 0.0))
+        points = player.get("total_points", 0)
+        minutes = player.get("minutes", 0)
+        
+        if minutes < 500: # Filter out players with very few minutes
+            continue
+
+        team_info = teams_map.get(team_id)
+        if not team_info:
+            continue
+            
+        team_short_name = team_info.get('short_name')
+        if not team_short_name:
             continue
         
-        # Look at the very next fixture
-        next_fixture = player['fixture_details'][0]
+        upcoming_fixtures_text = live_data.get('upcoming_fixtures', {}).get(team_short_name, [])
         
-        # A good TC candidate has great form and a fixture difficulty of 2 or less
-        if float(player.get('form', 0)) > 7.0 and next_fixture['difficulty'] <= 2:
-             triple_captain_recommendations.append({
-                "gameweek": next_fixture['gameweek'],
-                "player_recommendation": f"{player.name} ({player.team_name}) vs {next_fixture['opponent']}",
-                "reason": f"High form ({player.form}) and an easy fixture (Difficulty: {next_fixture['difficulty']})."
-            })
-             # Limit to a few top recommendations
-             if len(triple_captain_recommendations) >= 3:
-                 break
+        # A simple heuristic for fixture difficulty from the text
+        try:
+            avg_difficulty = sum([int(f.split('[')[1].split(']')[0]) for f in upcoming_fixtures_text]) / len(upcoming_fixtures_text) if upcoming_fixtures_text else 3
+        except (IndexError, ValueError):
+            avg_difficulty = 3 # Default difficulty
 
-    return {
-        "bench_boost": sorted(bench_boost_recommendations, key=lambda x: x['gameweek']),
-        "triple_captain": triple_captain_recommendations,
-        "status": "success"
-    }
+        # Composite score
+        score = (form * 3) + ((5 - avg_difficulty) * 1.5) + (points / 20)
+        
+        player_scores.append({
+            "name": player["web_name"],
+            "team": team_info["name"],
+            "position": position_map.get(player["element_type"]),
+            "price": player.get("now_cost", 0) / 10.0,
+            "form": form,
+            "points": points,
+            "score": round(score, 2)
+        })
+
+    return sorted(player_scores, key=lambda x: x["score"], reverse=True)[:limit]
+
+async def calculate_chip_recommendations(live_data: Dict[str, Any], number_of_recommendations: int = 3) -> Dict:
+    """
+    Calculates and recommends optimal gameweeks for using FPL chips.
+    """
+    try:
+        bootstrap_data = live_data["bootstrap"]
+        all_fixtures = live_data["all_fixtures"]
+        teams_map = {team["id"]: team for team in bootstrap_data["teams"]}
+        current_gw = next((gw['id'] for gw in bootstrap_data['events'] if gw['is_current']), 1)
+
+        team_fixtures_by_gw = identify_double_gameweeks(all_fixtures, current_gw)
+        
+        gameweek_metrics = []
+        future_gameweeks = sorted([gw for gw in team_fixtures_by_gw.keys() if gw >= current_gw])
+        
+        for gw in future_gameweeks:
+            if gw in team_fixtures_by_gw:
+                metrics = calculate_gameweek_difficulty(gw, team_fixtures_by_gw[gw], all_fixtures, teams_map)
+                gameweek_metrics.append(metrics)
+            
+        bench_boost_recs = sorted(
+            gameweek_metrics,
+            key=lambda x: (-x["teams_with_multiple_fixtures"], x["avg_fixture_difficulty"])
+        )[:number_of_recommendations]
+        
+        triple_captain_recs = sorted(
+            gameweek_metrics,
+            key=lambda x: x["difficulty_score"]
+        )[:number_of_recommendations]
+
+        return {
+            "bench_boost": bench_boost_recs,
+            "triple_captain": triple_captain_recs,
+            "status": "success"
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}

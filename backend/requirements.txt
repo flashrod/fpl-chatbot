@@ -1,15 +1,9 @@
-# backend/requirements.txt
 fastapi
-uvicorn
+uvicorn[standard]
 python-dotenv
 google-generativeai
 httpx
+cachetools
+pandas
 sentence-transformers
 faiss-cpu
-cachetools
-beautifulsoup4
-requests
-pandas
-lxml # pandas.read_html requires this
-apscheduler
-thefuzz
