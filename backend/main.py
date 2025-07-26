@@ -296,3 +296,4 @@ async def stream_chat_response(request: ChatRequest):
     except Exception as e:
         logging.error(f"Error during chat streaming: {e}")
         yield "Sorry, I encountered a critical server error.\n\n"
+        # end of code
