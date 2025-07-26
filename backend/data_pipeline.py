@@ -1,119 +1,108 @@
-import httpx
-import json
-import os
-from pathlib import Path
+import requests
+from bs4 import BeautifulSoup, Comment
 import pandas as pd
-import faiss 
-from sentence_transformers import SentenceTransformer
-import numpy as np # --- FIX: Import the numpy library ---
+import os
+import time
+from functools import reduce
 
 # --- Configuration ---
-SEASONS = ["2021-22", "2022-23", "2023-24"] 
-DATA_URL_TEMPLATE = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data/{season}/gws/merged_gw.csv"
-OUTPUT_DIR = Path(__file__).parent / "fpl_data"
-PROCESSED_DATA_PATH = OUTPUT_DIR / "processed_player_data.json"
-FAISS_INDEX_PATH = OUTPUT_DIR / "player_data.index"
+BASE_URL = "https://fbref.com"
+OUTPUT_DIR = "fpl_data"
+PLAYER_STATS_FILE = os.path.join(OUTPUT_DIR, "fbref_player_stats.csv")
 
-# --- Main Functions ---
+# URLs for different player statistic tables on FBref
+STAT_URLS = {
+    "standard": "/en/comps/9/stats/Premier-League-Stats",
+    "shooting": "/en/comps/9/shooting/Premier-League-Stats",
+    "passing": "/en/comps/9/passing/Premier-League-Stats",
+    "defense": "/en/comps/9/defense/Premier-League-Stats",
+    "possession": "/en/comps/9/possession/Premier-League-Stats",
+    "gca": "/en/comps/9/gca/Premier-League-Stats", # Goal and Shot Creation
+}
 
-def download_data():
-    print("--- Starting Historical Data Download ---")
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    with httpx.Client() as client:
-        for season in SEASONS:
-            url = DATA_URL_TEMPLATE.format(season=season)
-            output_path = OUTPUT_DIR / f"data_{season}.csv"
-            if output_path.exists():
-                print(f"Data for season {season} already exists. Skipping download.")
-                continue
-            print(f"Downloading data for season {season}...")
-            try:
-                response = client.get(url, timeout=30.0)
-                response.raise_for_status()
-                with open(output_path, "w", encoding="utf-8") as f:
-                    f.write(response.text)
-                print(f"✅ Successfully saved data for season {season}")
-            except Exception as e:
-                print(f"❌ Error downloading data for season {season}: {e}")
+# Headers to mimic a browser request
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}
 
-def process_data():
-    print("\n--- Starting Data Processing ---")
-    all_player_data = {}
-    for season in SEASONS:
-        file_path = OUTPUT_DIR / f"data_{season}.csv"
-        if not file_path.exists():
-            print(f"⚠️  Warning: Data file for season {season} not found.")
-            continue
-        print(f"Processing data for season {season}...")
-        df = pd.read_csv(file_path)
+def clean_player_name(df):
+    """Removes special characters from player names."""
+    if 'Player' in df.columns:
+        df['Player'] = df['Player'].str.split('\\').str[0].str.strip()
+    return df
+
+def fetch_stats_table(stat_type: str, url_suffix: str) -> pd.DataFrame | None:
+    """Fetches and parses a statistics table from an FBref URL, handling commented-out HTML."""
+    try:
+        full_url = BASE_URL + url_suffix
+        print(f"Fetching {stat_type} stats from {full_url}...")
         
-        # Get the final value for each player in the season
-        df['value'] = df['value'] / 10.0
-        final_values = df.loc[df.groupby('name')['GW'].idxmax()][['name', 'value']]
+        response = requests.get(full_url, headers=HEADERS)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'lxml')
+
+        table_id = f"stats_{stat_type}"
         
-        player_season_stats = df.groupby('name').agg(
-            total_points=('total_points', 'sum'),
-            goals_scored=('goals_scored', 'sum'),
-            assists=('assists', 'sum'),
-            minutes=('minutes', 'sum')
-        ).reset_index()
+        # --- THIS IS THE CORRECTED LINE ---
+        # The placeholder div ID is "all_..." not "div_..."
+        placeholder = soup.find('div', {'id': f'all_{table_id}'})
+        
+        if not placeholder:
+            print(f"❌ No placeholder div found for {table_id}")
+            return None
 
-        # Merge with final values
-        player_season_stats = pd.merge(player_season_stats, final_values, on='name', how='left')
+        comment = placeholder.find(string=lambda text: isinstance(text, Comment))
+        if not comment:
+            print(f"❌ No comment found for {table_id}. The table might be directly visible.")
+            table_html_str = str(placeholder.find('table', {'id': table_id}))
+        else:
+            comment_soup = BeautifulSoup(comment, 'lxml')
+            table_html_str = str(comment_soup.find('table', {'id': table_id}))
 
-        for _, row in player_season_stats.iterrows():
-            player_name = row['name']
-            if player_name not in all_player_data:
-                all_player_data[player_name] = {}
+        if 'None' in table_html_str:
+            print(f"❌ Could not extract table HTML for {table_id}")
+            return None
             
-            all_player_data[player_name][season] = {
-                'cost': round(row['value'], 1),
-                'total_points': int(row['total_points']),
-                'goals_scored': int(row['goals_scored']),
-                'assists': int(row['assists']),
-                'minutes_played': int(row['minutes'])
-            }
-    with open(PROCESSED_DATA_PATH, 'w', encoding='utf-8') as f:
-        json.dump(all_player_data, f, indent=2)
-    print(f"✅ Successfully processed and saved player data to {PROCESSED_DATA_PATH}")
+        df = pd.read_html(table_html_str, header=1)[0]
+        
+        df = df[df['Rk'].notna() & (df['Rk'] != 'Rk')]
+        df = df.drop(columns=['Rk', 'Matches'], errors='ignore')
+        df = clean_player_name(df)
+        
+        key_cols = ['Player', 'Nation', 'Pos', 'Squad', 'Age', 'Born', '90s']
+        df = df.rename(columns={c: f"{c}_{stat_type}" for c in df.columns if c not in key_cols})
 
-def create_vector_store():
-    print("\n--- Creating Vector Store (This may take a few minutes) ---")
-    if not PROCESSED_DATA_PATH.exists():
-        print("❌ Processed data file not found. Please run process_data() first.")
+        print(f"✅ Successfully fetched and processed {stat_type} stats.")
+        return df
+        
+    except Exception as e:
+        print(f"❌ Error fetching {stat_type} stats: {e}")
+        return None
+
+def run_data_pipeline():
+    """Main function to scrape all data, merge it, and save to a single file."""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    all_dfs = []
+    for stat_type, url_suffix in STAT_URLS.items():
+        df = fetch_stats_table(stat_type, url_suffix)
+        if df is not None:
+            all_dfs.append(df)
+        time.sleep(3)
+
+    if not all_dfs:
+        print("🚨 No dataframes were fetched. Exiting pipeline.")
         return
 
-    with open(PROCESSED_DATA_PATH, 'r', encoding='utf-8') as f:
-        player_data = json.load(f)
-
-    print("Loading sentence transformer model...")
-    model = SentenceTransformer('all-MiniLM-L6-v2')
+    print("\nMerging all player dataframes...")
+    merged_df = reduce(lambda left, right: pd.merge(left, right, on=['Player', 'Nation', 'Pos', 'Squad', 'Age', 'Born', '90s'], how='outer'), all_dfs)
     
-    player_names = list(player_data.keys())
-    player_descriptions = []
-    for name, seasons in player_data.items():
-        desc = f"Player: {name}. "
-        for season, stats in seasons.items():
-            desc += (f"In {season}, they cost around £{stats.get('cost', 'N/A')}m, "
-                     f"scored {stats['total_points']} points, "
-                     f"and played {stats['minutes_played']} minutes. ")
-        player_descriptions.append(desc)
+    for col in merged_df.columns:
+        if pd.api.types.is_numeric_dtype(merged_df[col]):
+            merged_df[col] = merged_df[col].fillna(0)
     
-    print(f"Creating embeddings for {len(player_names)} players...")
-    embeddings = model.encode(player_descriptions, show_progress_bar=True)
-
-    dimension = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dimension)
-    index = faiss.IndexIDMap(index)
+    merged_df.to_csv(PLAYER_STATS_FILE, index=False)
+    print(f"\n✅ Data pipeline complete. All player stats saved to '{PLAYER_STATS_FILE}'.")
     
-    ids = np.array(range(len(player_names)))
-    index.add_with_ids(embeddings, ids)
-
-    faiss.write_index(index, str(FAISS_INDEX_PATH))
-    print(f"✅ Vector store created and saved to {FAISS_INDEX_PATH}")
-
-
 if __name__ == "__main__":
-    download_data()
-    process_data()
-    create_vector_store()
+    run_data_pipeline()
