@@ -45,7 +45,6 @@ scheduler = AsyncIOScheduler()
 app = FastAPI(title="FPL AI Chatbot API")
 
 # --- Core Data Processing ---
-
 async def load_and_process_all_data():
     global master_fpl_data, current_gameweek_id, is_game_live
     logging.info("🔄 Starting data update process...")
@@ -237,7 +236,7 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame, full
     if team_found:
         df_filtered = all_players_df[all_players_df['team_name'] == team_found]
         if pos_found_code: df_filtered = df_filtered[df_filtered['position'] == pos_found_code]
-        if not df_filtered.empty: # <-- CORRECTED THIS LINE
+        if not df_filtered.empty:
             pos_str = pos_found_code or 'Players'
             team_full_name = full_team_names.get(team_found, team_found)
             title = f"List of {team_full_name} {pos_str}"
@@ -251,7 +250,8 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame, full
 # --- Main Chat Endpoint ---
 @app.post("/api/chat")
 async def chat_with_bot(request: ChatRequest):
-    return StreamingResponse(stream_chat_response(request), media_type="text/event-stream")
+    # FIX: Change media_type to "text/plain" for a smooth streaming effect
+    return StreamingResponse(stream_chat_response(request), media_type="text/plain")
 
 async def stream_chat_response(request: ChatRequest):
     if master_fpl_data is None:
@@ -295,4 +295,4 @@ async def stream_chat_response(request: ChatRequest):
 
     except Exception as e:
         logging.error(f"Error during chat streaming: {e}")
-        yield f"data: Sorry, I encountered a critical server error.\n\n"
+        yield "Sorry, I encountered a critical server error.\n\n"
