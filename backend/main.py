@@ -49,7 +49,6 @@ app = FastAPI(title="FPL AI Chatbot API")
 async def load_and_process_all_data():
     global master_fpl_data, current_gameweek_id, is_game_live
     logging.info("🔄 Starting data update process...")
-
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             bootstrap_task = client.get(FPL_API_BOOTSTRAP)
@@ -63,7 +62,6 @@ async def load_and_process_all_data():
 
     bootstrap_data = bootstrap_res.json()
     fixtures_data = fixtures_res.json()
-
     is_game_live = any(gw.get('is_current', False) for gw in bootstrap_data['events'])
     current_gameweek_id = next((gw['id'] for gw in bootstrap_data['events'] if gw.get('is_current', False)), 1)
     logging.info(f"ℹ️ FPL game live status: {is_game_live}. Current GW: {current_gameweek_id}")
@@ -97,7 +95,7 @@ async def load_and_process_all_data():
     fpl_players_df['avg_fixture_difficulty'] = fpl_players_df['team'].map(lambda tid: upcoming_fixtures_data.get(tid, {}).get('avg_difficulty'))
 
     if not FBREF_STATS_PATH.exists():
-        logging.error("❌ FBref stats file not found. Player performance stats (xG, xA) will be missing.")
+        logging.error("❌ FBref stats file not found.")
         fbref_df = pd.DataFrame()
     else:
         fbref_df = pd.read_csv(FBREF_STATS_PATH)
@@ -119,7 +117,7 @@ async def load_and_process_all_data():
     merged_df.set_index('Player', inplace=True)
     master_fpl_data = merged_df
     app.state.last_data_update = pd.Timestamp.now().isoformat()
-    logging.info("✅ Data update complete. Master DataFrame created.")
+    logging.info("✅ Data update complete.")
 
 # --- App Lifecycle Events ---
 @app.on_event("startup")
@@ -128,7 +126,7 @@ async def startup_event():
     await load_and_process_all_data()
     scheduler.add_job(load_and_process_all_data, IntervalTrigger(hours=12))
     scheduler.start()
-    logging.info("🚀 Server started and data refresh scheduler is running.")
+    logging.info("🚀 Server started.")
 
 @app.on_event("shutdown")
 def shutdown_event():
@@ -185,38 +183,7 @@ def _find_team_and_position(question_lower: str, full_team_names: dict) -> Tuple
 def build_context_for_question(question: str, all_players_df: pd.DataFrame, full_team_names: dict) -> Tuple[str, List[str]]:
     question_lower = question.lower()
     
-    # --- Intent 1: Specific Player Query (Corrected to handle duplicates) ---
-    player_names_found = []
-    cleaned_question = re.sub(r'\s+(or|vs)\s+', ' ', question_lower)
-    cleaned_question = re.sub(r'[^a-z0-9\s]', '', cleaned_question)
-
-    if 'simple_name' not in all_players_df.columns:
-        all_players_df['simple_name'] = all_players_df.index.str.lower().str.replace(r'[^a-z0-9\s]', '', regex=True)
-
-    # Use a vectorized approach for speed and to avoid manual loops
-    matching_players_series = all_players_df['simple_name'].dropna().apply(lambda name: name in cleaned_question)
-    
-    if matching_players_series.any():
-        player_names_found = all_players_df[matching_players_series].index.tolist()
-
-    if player_names_found:
-        return "", sorted(list(set(player_names_found)))
-
-    # --- Intent 2: List all players from a specific team and/or position ---
-    team_found, pos_found_code, _ = _find_team_and_position(question_lower, full_team_names)
-    if team_found:
-        df_filtered = all_players_df[all_players_df['team_name'] == team_found]
-        if pos_found_code: df_filtered = df_filtered[df_filtered['position'] == pos_found_code]
-        if not df_filtered.empty:
-            pos_str = pos_found_code or 'Players'
-            team_full_name = full_team_names.get(team_found, team_found)
-            title = f"List of {team_full_name} {pos_str}"
-            summary = f"\n--- {title} ---\n"
-            for _, player in df_filtered.sort_values(by='now_cost', ascending=False).iterrows():
-                summary += f"- {player.name} ({player.position}) - £{player.now_cost/10.0:.1f}m\n"
-            return summary, []
-
-    # --- Intent 3: Handle general "Top X" and fixture-based questions ---
+    # --- Intent 1: Handle general "Top X" and fixture-based questions (CHECK THIS FIRST) ---
     trigger_words = ['top', 'most', 'best', 'cheapest', 'worst', 'easiest', 'hardest', 'fixture', 'fixtures']
     if any(word in question_lower for word in trigger_words):
         limit_match = re.search(r'(\d+)', question_lower)
@@ -231,6 +198,7 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame, full
                 fixtures_str = ", ".join([f"{f['opponent']} ({'H' if f['is_home'] else 'A'})" for f in team['fixture_details']])
                 summary += f"- {full_team_names.get(team['team_name'])} (Avg Diff: {team['avg_fixture_difficulty']}): {fixtures_str}\n"
             return summary, []
+
         df_filtered = all_players_df.copy()
         _, pos_found_code, pos_found_str = _find_team_and_position(question_lower, full_team_names)
         if pos_found_code: df_filtered = df_filtered[df_filtered['position'] == pos_found_code]
@@ -250,6 +218,34 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame, full
             summary += f"- {player.name} ({player.team_name}, {player.position}) - {display_val}\n"
         return summary, []
 
+    # --- Intent 2: Specific Player Query ---
+    player_names_found = []
+    cleaned_question_words = set(re.sub(r'[^a-z0-9\s]', '', question_lower).split())
+
+    if 'simple_name_parts' not in all_players_df.columns:
+        all_players_df['simple_name_parts'] = all_players_df.index.to_series().str.lower().str.replace(r'[^a-z0-9\s]', '', regex=True).apply(lambda x: set(x.split()))
+
+    for name, row in all_players_df.iterrows():
+        if row['simple_name_parts'].issubset(cleaned_question_words):
+            player_names_found.append(name)
+            
+    if player_names_found:
+        return "", sorted(list(set(player_names_found)))
+
+    # --- Intent 3: List all players from a specific team and/or position ---
+    team_found, pos_found_code, _ = _find_team_and_position(question_lower, full_team_names)
+    if team_found:
+        df_filtered = all_players_df[all_players_df['team_name'] == team_found]
+        if pos_found_code: df_filtered = df_filtered[df_filtered['position'] == pos_found_code]
+        if not df_filtered.empty: # <-- CORRECTED THIS LINE
+            pos_str = pos_found_code or 'Players'
+            team_full_name = full_team_names.get(team_found, team_found)
+            title = f"List of {team_full_name} {pos_str}"
+            summary = f"\n--- {title} ---\n"
+            for _, player in df_filtered.sort_values(by='now_cost', ascending=False).iterrows():
+                summary += f"- {player.name} ({player.position}) - £{player.now_cost/10.0:.1f}m\n"
+            return summary, []
+
     return "", []
 
 # --- Main Chat Endpoint ---
@@ -259,12 +255,13 @@ async def chat_with_bot(request: ChatRequest):
 
 async def stream_chat_response(request: ChatRequest):
     if master_fpl_data is None:
-        yield "data: Sorry, the FPL data is not available. The server may still be initializing. Please try again in a moment.\n\n"
+        yield "data: Sorry, the FPL data is not available. Please try again.\n\n"
         return
 
     try:
-        full_conversation_text = " ".join([h.text for h in request.history]) + " " + request.question
-        general_summary, players_from_question = build_context_for_question(full_conversation_text, master_fpl_data, app.state.full_team_names)
+        general_summary, players_from_question = build_context_for_question(
+            request.question, master_fpl_data, app.state.full_team_names
+        )
         
         context_block = ""
         if players_from_question:
@@ -298,4 +295,4 @@ async def stream_chat_response(request: ChatRequest):
 
     except Exception as e:
         logging.error(f"Error during chat streaming: {e}")
-        yield f"data: Sorry, I encountered a critical server error. Please check the server logs for details.\n\n"
+        yield f"data: Sorry, I encountered a critical server error.\n\n"
