@@ -51,9 +51,9 @@ async def load_and_process_all_data():
     logging.info("🔄 Starting data update process...")
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            bootstrap_task = client.get(FPL_API_BOOTSTRAP)
-            fixtures_task = client.get(FPL_API_FIXTURES)
-            bootstrap_res, fixtures_res = await asyncio.gather(bootstrap_task, fixtures_task)
+            bootstrap_res, fixtures_res = await asyncio.gather(
+                client.get(FPL_API_BOOTSTRAP), client.get(FPL_API_FIXTURES)
+            )
         bootstrap_res.raise_for_status()
         fixtures_res.raise_for_status()
     except httpx.RequestError as e:
@@ -64,16 +64,14 @@ async def load_and_process_all_data():
     fixtures_data = fixtures_res.json()
     is_game_live = any(gw.get('is_current', False) for gw in bootstrap_data['events'])
     current_gameweek_id = next((gw['id'] for gw in bootstrap_data['events'] if gw.get('is_current', False)), 1)
-    logging.info(f"ℹ️ FPL game live status: {is_game_live}. Current GW: {current_gameweek_id}")
-
+    
     teams_map = {team['id']: team['short_name'] for team in bootstrap_data['teams']}
     position_map = {p_type['id']: p_type['singular_name_short'] for p_type in bootstrap_data['element_types']}
     app.state.full_team_names = {team['short_name']: team['name'] for team in bootstrap_data['teams']}
 
-    fpl_players_df = pd.DataFrame(bootstrap_data['elements'])
+    fpl_players_df = pd.DataFrame(bootstrap_data['elements']).rename(columns={'web_name': 'Player'})
     fpl_players_df['team_name'] = fpl_players_df['team'].map(teams_map)
     fpl_players_df['position'] = fpl_players_df['element_type'].map(position_map)
-    fpl_players_df = fpl_players_df.rename(columns={'web_name': 'Player'})
 
     fixtures_df = pd.DataFrame(fixtures_data)
     upcoming_fixtures_data = {}
@@ -94,17 +92,13 @@ async def load_and_process_all_data():
     fpl_players_df['fixture_details'] = fpl_players_df['team'].map(lambda tid: upcoming_fixtures_data.get(tid, {}).get('fixture_details'))
     fpl_players_df['avg_fixture_difficulty'] = fpl_players_df['team'].map(lambda tid: upcoming_fixtures_data.get(tid, {}).get('avg_difficulty'))
 
-    if not FBREF_STATS_PATH.exists():
-        logging.error("❌ FBref stats file not found.")
-        fbref_df = pd.DataFrame()
-    else:
+    if FBREF_STATS_PATH.exists():
         fbref_df = pd.read_csv(FBREF_STATS_PATH)
-
-    if not fbref_df.empty:
         fpl_players_df['Player_lower'] = fpl_players_df['Player'].str.lower()
         fbref_df['Player_lower'] = fbref_df['Player'].str.lower()
         merged_df = pd.merge(fpl_players_df, fbref_df, on='Player_lower', how='left', suffixes=('', '_fbref'))
     else:
+        logging.error("❌ FBref stats file not found.")
         merged_df = fpl_players_df
         
     merged_df.drop_duplicates(subset=['id'], keep='first', inplace=True)
@@ -113,13 +107,13 @@ async def load_and_process_all_data():
         if col not in merged_df.columns:
             merged_df[col] = 0
         merged_df[col].fillna(0, inplace=True)
-
+        
     merged_df.set_index('Player', inplace=True)
     master_fpl_data = merged_df
     app.state.last_data_update = pd.Timestamp.now().isoformat()
     logging.info("✅ Data update complete.")
 
-# --- App Lifecycle Events ---
+# --- App Lifecycle & Schemas ---
 @app.on_event("startup")
 async def startup_event():
     DATA_DIR.mkdir(exist_ok=True)
@@ -133,7 +127,6 @@ def shutdown_event():
     scheduler.shutdown()
     logging.info("👋 Scheduler shut down.")
 
-# --- CORS Middleware & Request Schema ---
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 class Player(BaseModel): name: str; position: str; cost: float; team_name: str
@@ -145,6 +138,18 @@ class ChatRequest(BaseModel): team_id: int = None; question: str; history: List[
 @app.get("/api/status")
 async def get_status():
     return {"status": "ok", "is_game_live": is_game_live, "current_gameweek": current_gameweek_id, "last_data_update": app.state.last_data_update if hasattr(app.state, 'last_data_update') else None, "players_in_master_df": len(master_fpl_data) if master_fpl_data is not None else 0}
+
+@app.get("/api/fixture-difficulty")
+async def get_fixture_difficulty_data():
+    if master_fpl_data is None:
+        raise HTTPException(status_code=503, detail="Data is not yet available.")
+    return chip_service.get_all_team_fixture_difficulty(master_fpl_data)
+
+@app.get("/api/chip-recommendations")
+async def get_chip_recommendations_data():
+    if master_fpl_data is None:
+        raise HTTPException(status_code=503, detail="Data is not yet available.")
+    return chip_service.calculate_chip_recommendations(master_fpl_data)
 
 @app.get("/api/get-team-data/{team_id}", response_model=TeamData)
 async def get_team_data(team_id: int):
@@ -168,16 +173,14 @@ async def get_team_data(team_id: int):
 # --- Context Builder ---
 def _find_team_and_position(question_lower: str, full_team_names: dict) -> Tuple[str, str, str]:
     position_map = { 'defenders': 'DEF', 'midfielders': 'MID', 'forwards': 'FWD', 'goalkeepers': 'GKP' }
-    team_found_short_name, pos_found_code = None, None
+    team_found_short_name, pos_found_code, pos_found_str = None, None, None
     for short, full in full_team_names.items():
         if full.lower() in question_lower or short.lower() in question_lower:
-            team_found_short_name = short
-            break
+            team_found_short_name = short; break
     for pos_str, pos_code in position_map.items():
         if pos_str in question_lower or pos_str[:-1] in question_lower:
-            pos_found_code = pos_code
-            break
-    return team_found_short_name, pos_found_code, pos_str if pos_found_code else None
+            pos_found_code = pos_code; pos_found_str = pos_str; break
+    return team_found_short_name, pos_found_code, pos_found_str
 
 def build_context_for_question(question: str, all_players_df: pd.DataFrame, full_team_names: dict) -> Tuple[str, List[str]]:
     question_lower = question.lower()
@@ -206,8 +209,10 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame, full
         elif "selected" in question_lower or "ownership" in question_lower: sort_by, metric_str = 'selected_by_percent', "Most Selected"
         elif "form" in question_lower: sort_by, metric_str = 'form', "Best Form"
         elif "points" in question_lower: sort_by, metric_str = 'total_points', "Highest Scoring"
+        
         df_filtered[sort_by] = pd.to_numeric(df_filtered[sort_by], errors='coerce')
         df_filtered.dropna(subset=[sort_by], inplace=True)
+
         top_players = df_filtered.sort_values(by=sort_by, ascending=ascending).head(limit)
         title = f"Top {limit} {metric_str} {pos_found_str or 'Players'}"
         summary = f"\n--- {title} ---\n"
@@ -220,14 +225,11 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame, full
     # --- Intent 2: Specific Player Query ---
     player_names_found = []
     cleaned_question_words = set(re.sub(r'[^a-z0-9\s]', '', question_lower).split())
-
     if 'simple_name_parts' not in all_players_df.columns:
         all_players_df['simple_name_parts'] = all_players_df.index.to_series().str.lower().str.replace(r'[^a-z0-9\s]', '', regex=True).apply(lambda x: set(x.split()))
-
     for name, row in all_players_df.iterrows():
         if row['simple_name_parts'].issubset(cleaned_question_words):
             player_names_found.append(name)
-            
     if player_names_found:
         return "", sorted(list(set(player_names_found)))
 
@@ -259,11 +261,11 @@ async def stream_chat_response(request: ChatRequest):
 
     try:
         question_lower = request.question.lower()
-        draft_keywords = ['draft', 'generate a team', 'build a squad', 'team for me']
+        draft_keywords = ['draft', 'generate', 'build', 'squad', 'team']
 
         gemini_history = [{"role": "model" if h.role == "bot" else "user", "parts": [{"text": h.text}]} for h in request.history]
 
-        if any(keyword in question_lower for keyword in draft_keywords):
+        if any(word in question_lower.split() for word in draft_keywords):
             # --- DRAFT GENERATION LOGIC ---
             engine = DraftEngine(master_fpl_data)
             draft_df = engine.create_draft()
@@ -306,9 +308,7 @@ async def stream_chat_response(request: ChatRequest):
                 context_block += "---\n"
             elif general_summary:
                 context_block = general_summary
-            else:
-                context_block = "I couldn't find specific data for your query. Please try rephrasing."
-
+            
             async for chunk in gemini_service.get_ai_response_stream(
                 request.question, gemini_history, context_block, is_game_live
             ):
