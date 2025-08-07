@@ -185,12 +185,11 @@ def _find_team_and_position(question_lower: str, full_team_names: dict) -> Tuple
 def build_context_for_question(question: str, all_players_df: pd.DataFrame, full_team_names: dict) -> Tuple[str, List[str]]:
     question_lower = question.lower()
     
-    # --- Intent 1: Handle general "Top X" and fixture-based questions (CHECK THIS FIRST) ---
     trigger_words = ['top', 'most', 'best', 'cheapest', 'worst', 'easiest', 'hardest', 'fixture', 'fixtures']
     if any(word in question_lower for word in trigger_words):
         limit_match = re.search(r'(\d+)', question_lower)
         limit = int(limit_match.group(1)) if limit_match else 5
-        if 'fixture' in question_lower or 'fixtures' in question_lower:
+        if 'fixture' in question_lower:
             team_data = all_players_df[['team_name', 'avg_fixture_difficulty', 'fixture_details']].drop_duplicates(subset=['team_name'])
             ascending = 'easiest' in question_lower or 'best' in question_lower
             sorted_teams = team_data.sort_values(by='avg_fixture_difficulty', ascending=ascending).head(limit)
@@ -206,7 +205,7 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame, full
         if pos_found_code: df_filtered = df_filtered[df_filtered['position'] == pos_found_code]
         sort_by, metric_str, ascending = ('now_cost', "Most Expensive", False)
         if "cheap" in question_lower: sort_by, metric_str, ascending = 'now_cost', "Cheapest", True
-        elif "selected" in question_lower or "ownership" in question_lower: sort_by, metric_str = 'selected_by_percent', "Most Selected"
+        elif "selected" in question_lower: sort_by, metric_str = 'selected_by_percent', "Most Selected"
         elif "form" in question_lower: sort_by, metric_str = 'form', "Best Form"
         elif "points" in question_lower: sort_by, metric_str = 'total_points', "Highest Scoring"
         
@@ -222,7 +221,6 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame, full
             summary += f"- {player.name} ({player.team_name}, {player.position}) - {display_val}\n"
         return summary, []
 
-    # --- Intent 2: Specific Player Query ---
     player_names_found = []
     cleaned_question_words = set(re.sub(r'[^a-z0-9\s]', '', question_lower).split())
     if 'simple_name_parts' not in all_players_df.columns:
@@ -233,7 +231,6 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame, full
     if player_names_found:
         return "", sorted(list(set(player_names_found)))
 
-    # --- Intent 3: List all players from a specific team and/or position ---
     team_found, pos_found_code, pos_found_str = _find_team_and_position(question_lower, full_team_names)
     if team_found:
         df_filtered = all_players_df[all_players_df['team_name'] == team_found]
@@ -262,15 +259,19 @@ async def stream_chat_response(request: ChatRequest):
     try:
         question_lower = request.question.lower()
         draft_keywords = ['draft', 'generate', 'build', 'squad', 'team']
-
         gemini_history = [{"role": "model" if h.role == "bot" else "user", "parts": [{"text": h.text}]} for h in request.history]
 
-        if any(word in question_lower.split() for word in draft_keywords):
-            # --- DRAFT GENERATION LOGIC ---
+        if any(keyword in question_lower for keyword in draft_keywords):
+            # --- DRAFT GENERATION LOGIC WITH STRATEGY ---
+            strategy = 'balanced' # Default strategy
+            if 'stars and scrubs' in question_lower or 'premium' in question_lower:
+                strategy = 'stars_and_scrubs'
+
             engine = DraftEngine(master_fpl_data)
-            draft_df = engine.create_draft()
+            draft_df = engine.create_draft(strategy=strategy)
             
-            context_block = "DRAFT COMPLETE. Remaining Budget: £{:.1f}m\n\n".format(engine.budget)
+            context_block = f"STRATEGY USED: {strategy.replace('_', ' ').title()}\n\n"
+            context_block += "DRAFT COMPLETE. Remaining Budget: £{:.1f}m\n\n".format(engine.budget)
             for position in ['GKP', 'DEF', 'MID', 'FWD']:
                 context_block += f"**{position}**:\n"
                 for _, player in draft_df[draft_df['position'] == position].iterrows():

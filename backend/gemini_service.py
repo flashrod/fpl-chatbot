@@ -38,7 +38,7 @@ async def get_ai_response_stream(
     mode: str = "live_season" 
 ):
     if not is_game_live:
-        mode = "live_season" # Use the same strict prompt for pre-season
+        mode = "live_season"
     
     system_instruction = SYSTEM_PROMPTS.get(mode, SYSTEM_PROMPTS["live_season"])
 
