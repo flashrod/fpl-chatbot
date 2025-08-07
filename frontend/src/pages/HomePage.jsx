@@ -6,33 +6,27 @@ import { motion } from 'framer-motion';
 
 const HomePage = ({ onLogin }) => {
   return (
-    <div className="w-full h-screen overflow-y-auto bg-slate-900">
-      {/* Animated background blobs */}
-      <div className="absolute top-0 left-0 w-full h-full overflow-hidden z-0">
+    <div className="w-full h-screen overflow-y-auto bg-slate-900 text-white font-sans relative isolate">
+      {/* Background Blobs */}
+      <div className="absolute inset-0 -z-10 overflow-hidden">
         <motion.div 
           className="absolute top-[-20%] left-[-20%] w-[40rem] h-[40rem] bg-green-500/10 rounded-full filter blur-3xl"
           animate={{ x: [0, 100, 0], y: [0, -50, 0] }}
-          transition={{ repeat: Infinity, duration: 20, ease: "easeInOut" }}
+          transition={{ repeat: Infinity, duration: 25, ease: "easeInOut" }}
         />
         <motion.div 
           className="absolute bottom-[-20%] right-[-20%] w-[50rem] h-[50rem] bg-blue-500/10 rounded-full filter blur-3xl"
           animate={{ x: [0, -80, 0], y: [0, 40, 0] }}
-          transition={{ repeat: Infinity, duration: 22, ease: "easeInOut", delay: 2 }}
+          transition={{ repeat: Infinity, duration: 28, ease: "easeInOut", delay: 2 }}
         />
       </div>
       
-      {/* Hero Section with Login */}
-      <div className="min-h-screen flex items-center justify-center relative">
-        <LoginPage onLogin={onLogin} />
-      </div>
-
-      {/* Features Section */}
-      <div className="relative">
+      {/* Main Content */}
+      <div className="relative z-10">
+        <div className="flex items-center justify-center min-h-screen px-4 py-20 md:py-32">
+          <LoginPage onLogin={onLogin} />
+        </div>
         <LandingPageFeatures />
-      </div>
-
-      {/* About/Footer Section */}
-      <div className="relative">
         <LandingPageAbout />
       </div>
     </div>
