@@ -46,7 +46,7 @@ const TeamPitch = ({ teamId }) => {
       setLoading(true);
       setError('');
       try {
-        const response = await fetch(`http://127.0.0.1:8000/api/get-team-data/${teamId}`);
+        const response = await fetch(`https://fpl-chatbot-4zm5.onrender.com/api/get-team-data/${teamId}`);
         if (!response.ok) {
           const errorData = await response.json();
           throw new Error(errorData.detail || 'Failed to fetch team data.');

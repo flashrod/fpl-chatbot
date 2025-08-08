@@ -11,7 +11,7 @@ const FixturesPage = () => {
       setLoading(true);
       setError('');
       try {
-        const response = await fetch('http://127.0.0.1:8000/api/fixture-difficulty');
+        const response = await fetch('https://fpl-chatbot-4zm5.onrender.com/api/fixture-difficulty');
         if (!response.ok) {
           throw new Error(`Failed to fetch fixture data (Status: ${response.status})`);
         }

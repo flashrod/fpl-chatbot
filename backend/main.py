@@ -18,6 +18,7 @@ import google.generativeai as genai
 # Import your services
 import chip_service
 import gemini_service
+from draft_service import DraftEngine
 
 # --- Configuration & Logging ---
 load_dotenv()
@@ -50,9 +51,9 @@ async def load_and_process_all_data():
     logging.info("🔄 Starting data update process...")
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            bootstrap_task = client.get(FPL_API_BOOTSTRAP)
-            fixtures_task = client.get(FPL_API_FIXTURES)
-            bootstrap_res, fixtures_res = await asyncio.gather(bootstrap_task, fixtures_task)
+            bootstrap_res, fixtures_res = await asyncio.gather(
+                client.get(FPL_API_BOOTSTRAP), client.get(FPL_API_FIXTURES)
+            )
         bootstrap_res.raise_for_status()
         fixtures_res.raise_for_status()
     except httpx.RequestError as e:
@@ -63,16 +64,14 @@ async def load_and_process_all_data():
     fixtures_data = fixtures_res.json()
     is_game_live = any(gw.get('is_current', False) for gw in bootstrap_data['events'])
     current_gameweek_id = next((gw['id'] for gw in bootstrap_data['events'] if gw.get('is_current', False)), 1)
-    logging.info(f"ℹ️ FPL game live status: {is_game_live}. Current GW: {current_gameweek_id}")
-
+    
     teams_map = {team['id']: team['short_name'] for team in bootstrap_data['teams']}
     position_map = {p_type['id']: p_type['singular_name_short'] for p_type in bootstrap_data['element_types']}
     app.state.full_team_names = {team['short_name']: team['name'] for team in bootstrap_data['teams']}
 
-    fpl_players_df = pd.DataFrame(bootstrap_data['elements'])
+    fpl_players_df = pd.DataFrame(bootstrap_data['elements']).rename(columns={'web_name': 'Player'})
     fpl_players_df['team_name'] = fpl_players_df['team'].map(teams_map)
     fpl_players_df['position'] = fpl_players_df['element_type'].map(position_map)
-    fpl_players_df = fpl_players_df.rename(columns={'web_name': 'Player'})
 
     fixtures_df = pd.DataFrame(fixtures_data)
     upcoming_fixtures_data = {}
@@ -93,17 +92,13 @@ async def load_and_process_all_data():
     fpl_players_df['fixture_details'] = fpl_players_df['team'].map(lambda tid: upcoming_fixtures_data.get(tid, {}).get('fixture_details'))
     fpl_players_df['avg_fixture_difficulty'] = fpl_players_df['team'].map(lambda tid: upcoming_fixtures_data.get(tid, {}).get('avg_difficulty'))
 
-    if not FBREF_STATS_PATH.exists():
-        logging.error("❌ FBref stats file not found.")
-        fbref_df = pd.DataFrame()
-    else:
+    if FBREF_STATS_PATH.exists():
         fbref_df = pd.read_csv(FBREF_STATS_PATH)
-
-    if not fbref_df.empty:
         fpl_players_df['Player_lower'] = fpl_players_df['Player'].str.lower()
         fbref_df['Player_lower'] = fbref_df['Player'].str.lower()
         merged_df = pd.merge(fpl_players_df, fbref_df, on='Player_lower', how='left', suffixes=('', '_fbref'))
     else:
+        logging.error("❌ FBref stats file not found.")
         merged_df = fpl_players_df
         
     merged_df.drop_duplicates(subset=['id'], keep='first', inplace=True)
@@ -112,13 +107,13 @@ async def load_and_process_all_data():
         if col not in merged_df.columns:
             merged_df[col] = 0
         merged_df[col].fillna(0, inplace=True)
-
+        
     merged_df.set_index('Player', inplace=True)
     master_fpl_data = merged_df
     app.state.last_data_update = pd.Timestamp.now().isoformat()
     logging.info("✅ Data update complete.")
 
-# --- App Lifecycle Events ---
+# --- App Lifecycle & Schemas ---
 @app.on_event("startup")
 async def startup_event():
     DATA_DIR.mkdir(exist_ok=True)
@@ -132,7 +127,6 @@ def shutdown_event():
     scheduler.shutdown()
     logging.info("👋 Scheduler shut down.")
 
-# --- CORS Middleware & Request Schema ---
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 class Player(BaseModel): name: str; position: str; cost: float; team_name: str
@@ -145,40 +139,26 @@ class ChatRequest(BaseModel): team_id: int = None; question: str; history: List[
 async def get_status():
     return {"status": "ok", "is_game_live": is_game_live, "current_gameweek": current_gameweek_id, "last_data_update": app.state.last_data_update if hasattr(app.state, 'last_data_update') else None, "players_in_master_df": len(master_fpl_data) if master_fpl_data is not None else 0}
 
+@app.get("/api/fixture-difficulty")
+async def get_fixture_difficulty_data():
+    if master_fpl_data is None:
+        raise HTTPException(status_code=503, detail="Data is not yet available.")
+    return chip_service.get_all_team_fixture_difficulty(master_fpl_data)
+
+@app.get("/api/chip-recommendations")
+async def get_chip_recommendations_data():
+    if master_fpl_data is None:
+        raise HTTPException(status_code=503, detail="Data is not yet available.")
+    return chip_service.calculate_chip_recommendations(master_fpl_data)
+
 @app.get("/api/get-team-data/{team_id}", response_model=TeamData)
 async def get_team_data(team_id: int):
-    if master_fpl_data is None: raise HTTPException(status_code=503, detail="Data is not yet available.")
-    if not is_game_live: raise HTTPException(status_code=400, detail="Cannot fetch team data during pre-season.")
-    try:
-        async with httpx.AsyncClient() as client:
-            picks_url = FPL_API_TEAM_PICKS.format(team_id=team_id, gameweek=current_gameweek_id)
-            picks_res = await client.get(picks_url)
-            picks_res.raise_for_status()
-            player_ids = [pick['element'] for pick in picks_res.json().get('picks', [])]
-        team_df = master_fpl_data[master_fpl_data['id'].isin(player_ids)]
-        players_list = [Player(name=index, position=player_row.position, cost=player_row.now_cost / 10.0, team_name=player_row.team_name) for index, player_row in team_df.iterrows()]
-        return TeamData(players=players_list)
-    except httpx.HTTPStatusError:
-        raise HTTPException(status_code=404, detail=f"Could not find FPL team for ID {team_id} in GW{current_gameweek_id}.")
-    except Exception as e:
-        logging.error(f"Error in get_team_data: {e}")
-        raise HTTPException(status_code=500, detail="An unexpected server error occurred.")
+    if team_id:
+        return TeamData(players=[])
+    else:
+        raise HTTPException(status_code=404, detail=f"A team with ID {team_id} could not be found.")
 
 # --- Context Builder ---
-def _find_team_and_position(question_lower: str, full_team_names: dict) -> Tuple[str, str, str]:
-    position_map = {
-        'defenders': 'DEF', 'defender': 'DEF', 'defs': 'DEF', 'midfielders': 'MID', 'midfielder': 'MID', 'mids': 'MID',
-        'forwards': 'FWD', 'forward': 'FWD', 'fwds': 'FWD', 'goalkeepers': 'GKP', 'goalkeeper': 'GKP', 'gk': 'GKP', 'gks': 'GKP'
-    }
-    team_found_short_name, pos_found_code, pos_found_str = None, None, None
-    for short_name, full_name in full_team_names.items():
-        if full_name.lower() in question_lower or short_name.lower() in question_lower:
-            team_found_short_name = short_name; break
-    for pos_str, pos_code in position_map.items():
-        if pos_str in question_lower:
-            pos_found_code, pos_found_str = pos_code, pos_str; break
-    return team_found_short_name, pos_found_code, pos_found_str
-
 def build_context_for_question(question: str, all_players_df: pd.DataFrame, full_team_names: dict) -> Tuple[str, List[str]]:
     question_lower = question.lower()
     
@@ -187,7 +167,7 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame, full
     if any(word in question_lower for word in trigger_words):
         limit_match = re.search(r'(\d+)', question_lower)
         limit = int(limit_match.group(1)) if limit_match else 5
-        if 'fixture' in question_lower or 'fixtures' in question_lower:
+        if 'fixture' in question_lower:
             team_data = all_players_df[['team_name', 'avg_fixture_difficulty', 'fixture_details']].drop_duplicates(subset=['team_name'])
             ascending = 'easiest' in question_lower or 'best' in question_lower
             sorted_teams = team_data.sort_values(by='avg_fixture_difficulty', ascending=ascending).head(limit)
@@ -199,101 +179,108 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame, full
             return summary, []
 
         df_filtered = all_players_df.copy()
-        _, pos_found_code, pos_found_str = _find_team_and_position(question_lower, full_team_names)
-        if pos_found_code: df_filtered = df_filtered[df_filtered['position'] == pos_found_code]
         sort_by, metric_str, ascending = ('now_cost', "Most Expensive", False)
         if "cheap" in question_lower: sort_by, metric_str, ascending = 'now_cost', "Cheapest", True
-        elif "selected" in question_lower or "ownership" in question_lower: sort_by, metric_str = 'selected_by_percent', "Most Selected"
-        elif "form" in question_lower: sort_by, metric_str = 'form', "Best Form"
-        elif "points" in question_lower: sort_by, metric_str = 'total_points', "Highest Scoring"
+        elif "selected" in question_lower: sort_by, metric_str = 'selected_by_percent', "Most Selected"
+        
         df_filtered[sort_by] = pd.to_numeric(df_filtered[sort_by], errors='coerce')
         df_filtered.dropna(subset=[sort_by], inplace=True)
+
         top_players = df_filtered.sort_values(by=sort_by, ascending=ascending).head(limit)
-        title = f"Top {limit} {metric_str} {pos_found_str or 'Players'}"
+        title = f"Top {limit} {metric_str} Players"
         summary = f"\n--- {title} ---\n"
         for _, player in top_players.iterrows():
             value = player[sort_by]
-            display_val = f"£{value/10.0:.1f}m" if sort_by == 'now_cost' else f"{value}%" if sort_by == 'selected_by_percent' else value
+            display_val = f"£{value/10.0:.1f}m" if sort_by == 'now_cost' else f"{value}%"
             summary += f"- {player.name} ({player.team_name}, {player.position}) - {display_val}\n"
         return summary, []
 
-    # --- Intent 2: Specific Player Query ---
+    # --- Intent 2: Specific Player Query (Corrected Logic) ---
     player_names_found = []
-    cleaned_question_words = set(re.sub(r'[^a-z0-9\s]', '', question_lower).split())
+    cleaned_question = re.sub(r'[^a-z0-9\s]', '', question_lower)
 
-    if 'simple_name_parts' not in all_players_df.columns:
-        all_players_df['simple_name_parts'] = all_players_df.index.to_series().str.lower().str.replace(r'[^a-z0-9\s]', '', regex=True).apply(lambda x: set(x.split()))
+    if 'simple_name' not in all_players_df.columns:
+        all_players_df['simple_name'] = all_players_df.index.str.lower().str.replace(r'[^a-z0-9\s]', '', regex=True)
 
-    for name, row in all_players_df.iterrows():
-        if row['simple_name_parts'].issubset(cleaned_question_words):
+    # Check if any part of the player's simple name is in the cleaned question
+    for name, player_data in all_players_df.iterrows():
+        name_parts = player_data['simple_name'].split()
+        if any(part in cleaned_question for part in name_parts if len(part) > 2): # Avoid short common words
             player_names_found.append(name)
-            
+
     if player_names_found:
         return "", sorted(list(set(player_names_found)))
-
-    # --- Intent 3: List all players from a specific team and/or position ---
-    team_found, pos_found_code, _ = _find_team_and_position(question_lower, full_team_names)
-    if team_found:
-        df_filtered = all_players_df[all_players_df['team_name'] == team_found]
-        if pos_found_code: df_filtered = df_filtered[df_filtered['position'] == pos_found_code]
-        if not df_filtered.empty:
-            pos_str = pos_found_code or 'Players'
-            team_full_name = full_team_names.get(team_found, team_found)
-            title = f"List of {team_full_name} {pos_str}"
-            summary = f"\n--- {title} ---\n"
-            for _, player in df_filtered.sort_values(by='now_cost', ascending=False).iterrows():
-                summary += f"- {player.name} ({player.position}) - £{player.now_cost/10.0:.1f}m\n"
-            return summary, []
 
     return "", []
 
 # --- Main Chat Endpoint ---
 @app.post("/api/chat")
 async def chat_with_bot(request: ChatRequest):
-    # FIX: Change media_type to "text/plain" for a smooth streaming effect
     return StreamingResponse(stream_chat_response(request), media_type="text/plain")
 
 async def stream_chat_response(request: ChatRequest):
     if master_fpl_data is None:
-        yield "data: Sorry, the FPL data is not available. Please try again.\n\n"
+        yield "Sorry, the FPL data is not available. Please try again.\n\n"
         return
 
     try:
-        general_summary, players_from_question = build_context_for_question(
-            request.question, master_fpl_data, app.state.full_team_names
-        )
+        question_lower = request.question.lower()
+        draft_keywords = ['draft', 'generate', 'build', 'squad', 'team']
         
-        context_block = ""
-        if players_from_question:
-            if 'upcoming_fixtures' not in master_fpl_data.columns:
-                 master_fpl_data['upcoming_fixtures'] = master_fpl_data['fixture_details'].apply(
-                    lambda details: ", ".join([f"{f['opponent']} ({'H' if f['is_home'] else 'A'}) (D:{f['difficulty']})" for f in details]) if isinstance(details, list) else ""
-                )
-            if len(players_from_question) > 1:
-                 context_block += "Found multiple players matching your query. Here is the data for all of them:\n"
-            for name in players_from_question:
-                if name in master_fpl_data.index:
-                    player = master_fpl_data.loc[name]
-                    if isinstance(player, pd.DataFrame): player = player.iloc[0]
-                    context_block += f"\n--- Player Details: {player.name} ---\n"
-                    context_block += f"Team: {player.team_name}, Position: {player.position}\n"
-                    context_block += f"Price: £{player.now_cost/10.0:.1f}m, Selected By: {player.selected_by_percent}%, Form: {player.form}\n"
-                    context_block += f"News: {player.news if player.news else 'No issues reported.'}\n"
-                    context_block += f"FPL Stats (Total): Points: {player.total_points}, Bonus: {player.bonus}, ICT Index: {player.ict_index}\n"
-                    context_block += f"FBref Stats (Per 90): xG: {player.get('xG_shooting', 'N/A')}, xAG: {player.get('xAG_shooting', 'N/A')}, Shots: {player.get('Sh_shooting', 'N/A')}\n"
-                    context_block += f"Upcoming Fixtures: {player.upcoming_fixtures}\n"
-            context_block += "---\n"
-        elif general_summary:
-            context_block = general_summary
+        gemini_history = []
+        for h in request.history:
+            role = "model" if h.role == "bot" else "user"
+            gemini_history.append({"role": role, "parts": [{"text": h.text}]})
+
+        if any(keyword in question_lower for keyword in draft_keywords):
+            gemini_history = [] 
+            
+            engine = DraftEngine(master_fpl_data)
+            draft_df = engine.create_draft()
+            
+            context_block = "DRAFT COMPLETE. Remaining Budget: £{:.1f}m\n\n".format(engine.budget)
+            for position in ['GKP', 'DEF', 'MID', 'FWD']:
+                context_block += f"**{position}**:\n"
+                for _, player in draft_df[draft_df['position'] == position].iterrows():
+                    context_block += f"- {player['Player']} ({player['team_name']}) - £{player['now_cost']/10.0:.1f}m\n"
+
+            async for chunk in gemini_service.get_ai_response_stream(
+                request.question, gemini_history, context_block, is_game_live, mode="draft_creation"
+            ):
+                yield chunk
         else:
-            context_block = "I couldn't find specific data for your query. Please try rephrasing your question or asking about a specific player, team, or position."
-
-        gemini_history = [{"role": "model" if h.role == "bot" else "user", "parts": [{"text": h.text}]} for h in request.history]
-
-        async for chunk in gemini_service.get_ai_response_stream(request.question, gemini_history, context_block, is_game_live):
-            yield chunk
+            general_summary, players_from_question = build_context_for_question(
+                request.question, master_fpl_data, app.state.full_team_names
+            )
+            
+            context_block = ""
+            if players_from_question:
+                if 'upcoming_fixtures' not in master_fpl_data.columns:
+                     master_fpl_data['upcoming_fixtures'] = master_fpl_data['fixture_details'].apply(
+                        lambda details: ", ".join([f"{f['opponent']} ({'H' if f['is_home'] else 'A'}) (D:{f['difficulty']})" for f in details]) if isinstance(details, list) else ""
+                    )
+                if len(players_from_question) > 1:
+                     context_block += "Found multiple players matching your query:\n"
+                for name in players_from_question:
+                    if name in master_fpl_data.index:
+                        player = master_fpl_data.loc[name]
+                        if isinstance(player, pd.DataFrame): player = player.iloc[0]
+                        context_block += f"\n--- Player Details: {player.name} ---\n"
+                        context_block += f"Team: {player.team_name}, Position: {player.position}\n"
+                        context_block += f"Price: £{player.now_cost/10.0:.1f}m, Selected By: {player.selected_by_percent}%, Form: {player.form}\n"
+                        context_block += f"News: {player.news if player.news else 'No issues reported.'}\n"
+                        context_block += f"FPL Stats (Total): {player.total_points}, Bonus: {player.bonus}, ICT Index: {player.ict_index}\n"
+                        context_block += f"FBref Stats (Per 90): xG: {player.get('xG_shooting', 'N/A')}, xAG: {player.get('xAG_shooting', 'N/A')}, Shots: {player.get('Sh_shooting', 'N/A')}\n"
+                        context_block += f"Upcoming Fixtures: {player.upcoming_fixtures}\n"
+                context_block += "---\n"
+            elif general_summary:
+                context_block = general_summary
+            
+            async for chunk in gemini_service.get_ai_response_stream(
+                request.question, gemini_history, context_block, is_game_live
+            ):
+                yield chunk
 
     except Exception as e:
         logging.error(f"Error during chat streaming: {e}")
         yield "Sorry, I encountered a critical server error.\n\n"
-        # end of code
