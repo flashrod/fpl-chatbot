@@ -49,22 +49,32 @@ app = FastAPI(title="FPL AI Chatbot API")
 async def load_and_process_all_data():
     global master_fpl_data, current_gameweek_id, is_game_live
     logging.info("🔄 Starting data update process...")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
             bootstrap_res, fixtures_res = await asyncio.gather(
-                client.get(FPL_API_BOOTSTRAP), client.get(FPL_API_FIXTURES)
+                client.get(FPL_API_BOOTSTRAP),
+                client.get(FPL_API_FIXTURES)
             )
         bootstrap_res.raise_for_status()
         fixtures_res.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        logging.error(f"❌ HTTP error: {e.response.status_code} - {e.response.text}")
+        return
     except httpx.RequestError as e:
-        logging.error(f"❌ Failed to fetch live FPL data: {e}. Aborting update.")
+        logging.error(f"❌ Network error during FPL data fetch: {e}")
         return
 
     bootstrap_data = bootstrap_res.json()
     fixtures_data = fixtures_res.json()
+
     is_game_live = any(gw.get('is_current', False) for gw in bootstrap_data['events'])
     current_gameweek_id = next((gw['id'] for gw in bootstrap_data['events'] if gw.get('is_current', False)), 1)
-    
+
     teams_map = {team['id']: team['short_name'] for team in bootstrap_data['teams']}
     position_map = {p_type['id']: p_type['singular_name_short'] for p_type in bootstrap_data['element_types']}
     app.state.full_team_names = {team['short_name']: team['name'] for team in bootstrap_data['teams']}
@@ -76,7 +86,10 @@ async def load_and_process_all_data():
     fixtures_df = pd.DataFrame(fixtures_data)
     upcoming_fixtures_data = {}
     for team_id in teams_map.keys():
-        team_fixtures = fixtures_df[((fixtures_df['team_h'] == team_id) | (fixtures_df['team_a'] == team_id)) & (fixtures_df['event'] >= current_gameweek_id)]
+        team_fixtures = fixtures_df[
+            ((fixtures_df['team_h'] == team_id) | (fixtures_df['team_a'] == team_id)) &
+            (fixtures_df['event'] >= current_gameweek_id)
+        ]
         fixtures_to_analyze = team_fixtures.head(5)
         fixture_details_list = []
         total_difficulty = 0
@@ -84,13 +97,25 @@ async def load_and_process_all_data():
             is_home = row['team_h'] == team_id
             opponent = teams_map.get(row['team_a'] if is_home else row['team_h'])
             difficulty = row['team_h_difficulty'] if is_home else row['team_a_difficulty']
-            fixture_details_list.append({"gameweek": row.get("event"), "opponent": opponent, "is_home": is_home, "difficulty": difficulty})
+            fixture_details_list.append({
+                "gameweek": row.get("event"),
+                "opponent": opponent,
+                "is_home": is_home,
+                "difficulty": difficulty
+            })
             total_difficulty += difficulty
         avg_difficulty = total_difficulty / len(fixtures_to_analyze) if not fixtures_to_analyze.empty else 5.0
-        upcoming_fixtures_data[team_id] = {"fixture_details": fixture_details_list, "avg_difficulty": round(avg_difficulty, 2)}
+        upcoming_fixtures_data[team_id] = {
+            "fixture_details": fixture_details_list,
+            "avg_difficulty": round(avg_difficulty, 2)
+        }
 
-    fpl_players_df['fixture_details'] = fpl_players_df['team'].map(lambda tid: upcoming_fixtures_data.get(tid, {}).get('fixture_details'))
-    fpl_players_df['avg_fixture_difficulty'] = fpl_players_df['team'].map(lambda tid: upcoming_fixtures_data.get(tid, {}).get('avg_difficulty'))
+    fpl_players_df['fixture_details'] = fpl_players_df['team'].map(
+        lambda tid: upcoming_fixtures_data.get(tid, {}).get('fixture_details')
+    )
+    fpl_players_df['avg_fixture_difficulty'] = fpl_players_df['team'].map(
+        lambda tid: upcoming_fixtures_data.get(tid, {}).get('avg_difficulty')
+    )
 
     if FBREF_STATS_PATH.exists():
         fbref_df = pd.read_csv(FBREF_STATS_PATH)
@@ -100,14 +125,15 @@ async def load_and_process_all_data():
     else:
         logging.error("❌ FBref stats file not found.")
         merged_df = fpl_players_df
-        
+
     merged_df.drop_duplicates(subset=['id'], keep='first', inplace=True)
-    fbref_numeric_cols = ['Min_standard', 'Gls_standard', 'Ast_standard', 'xG_shooting', 'xAG_shooting', 'Sh_shooting', 'KP_passing', 'SCA_gca', 'Att Pen_possession']
+    fbref_numeric_cols = ['Min_standard', 'Gls_standard', 'Ast_standard', 'xG_shooting',
+                          'xAG_shooting', 'Sh_shooting', 'KP_passing', 'SCA_gca', 'Att Pen_possession']
     for col in fbref_numeric_cols:
         if col not in merged_df.columns:
             merged_df[col] = 0
         merged_df[col].fillna(0, inplace=True)
-        
+
     merged_df.set_index('Player', inplace=True)
     master_fpl_data = merged_df
     app.state.last_data_update = pd.Timestamp.now().isoformat()
@@ -127,17 +153,41 @@ def shutdown_event():
     scheduler.shutdown()
     logging.info("👋 Scheduler shut down.")
 
-app.add_middleware(CORSMiddleware, allow_origins=["https://fpl-brain.vercel.app"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware,
+    allow_origins=["https://fpl-brain.vercel.app"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
-class Player(BaseModel): name: str; position: str; cost: float; team_name: str
-class TeamData(BaseModel): players: List[Player]
-class ChatMessage(BaseModel): role: str; text: str
-class ChatRequest(BaseModel): team_id: int = None; question: str; history: List[ChatMessage] = Field(default_factory=list)
+class Player(BaseModel):
+    name: str
+    position: str
+    cost: float
+    team_name: str
+
+class TeamData(BaseModel):
+    players: List[Player]
+
+class ChatMessage(BaseModel):
+    role: str
+    text: str
+
+class ChatRequest(BaseModel):
+    team_id: int = None
+    question: str
+    history: List[ChatMessage] = Field(default_factory=list)
 
 # --- API Endpoints ---
 @app.get("/api/status")
 async def get_status():
-    return {"status": "ok", "is_game_live": is_game_live, "current_gameweek": current_gameweek_id, "last_data_update": app.state.last_data_update if hasattr(app.state, 'last_data_update') else None, "players_in_master_df": len(master_fpl_data) if master_fpl_data is not None else 0}
+    return {
+        "status": "ok",
+        "is_game_live": is_game_live,
+        "current_gameweek": current_gameweek_id,
+        "last_data_update": app.state.last_data_update if hasattr(app.state, 'last_data_update') else None,
+        "players_in_master_df": len(master_fpl_data) if master_fpl_data is not None else 0
+    }
 
 @app.get("/api/fixture-difficulty")
 async def get_fixture_difficulty_data():
