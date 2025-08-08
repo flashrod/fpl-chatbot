@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import NavBar from '../components/NavBar';
+import NavBar from '../components/Navbar';
 
 const MainLayout = ({ children, onLogout }) => {
   const [isNavCollapsed, setIsNavCollapsed] = useState(false);
