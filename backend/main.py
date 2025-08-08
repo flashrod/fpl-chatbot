@@ -127,7 +127,7 @@ def shutdown_event():
     scheduler.shutdown()
     logging.info("👋 Scheduler shut down.")
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["https://fpl-brain.vercel.app"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 class Player(BaseModel): name: str; position: str; cost: float; team_name: str
 class TeamData(BaseModel): players: List[Player]
