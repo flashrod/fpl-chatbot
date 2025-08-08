@@ -5,13 +5,32 @@ const FixturesPage = () => {
   const [fixturesData, setFixturesData] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [statusMessage, setStatusMessage] = useState('Connecting to server...');
 
   useEffect(() => {
-    const fetchFixtures = async () => {
-      setLoading(true);
-      setError('');
+    const API_BASE_URL = 'https://fpl-chatbot-4zm5.onrender.com'; // Use your deployed URL
+
+    const checkServerStatus = async () => {
       try {
-        const response = await fetch('https://fpl-chatbot-4zm5.onrender.com/api/fixture-difficulty');
+        const response = await fetch(`${API_BASE_URL}/api/status`);
+        if (!response.ok) {
+          throw new Error('Server is not responding.');
+        }
+        const data = await response.json();
+        if (data.players_in_master_df > 0) {
+          return true; // Server is ready
+        }
+        setStatusMessage('Server is starting up, loading data...');
+        return false; // Server is not ready yet
+      } catch (err) {
+        setStatusMessage('Could not connect to the server. It might be starting up.');
+        return false;
+      }
+    };
+
+    const fetchFixtures = async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/fixture-difficulty`);
         if (!response.ok) {
           throw new Error(`Failed to fetch fixture data (Status: ${response.status})`);
         }
@@ -24,15 +43,36 @@ const FixturesPage = () => {
       }
     };
 
-    fetchFixtures();
+    const startFetching = async () => {
+      setLoading(true);
+      setError('');
+      
+      const isReady = await checkServerStatus();
+      if (isReady) {
+        setStatusMessage('Fetching fixture data...');
+        fetchFixtures();
+      } else {
+        // If not ready, poll every 3 seconds
+        const interval = setInterval(async () => {
+          const ready = await checkServerStatus();
+          if (ready) {
+            clearInterval(interval);
+            setStatusMessage('Fetching fixture data...');
+            fetchFixtures();
+          }
+        }, 3000);
+        return () => clearInterval(interval);
+      }
+    };
+
+    startFetching();
   }, []);
 
-  // This function maps a difficulty score (1-5) to a specific color.
   const getDifficultyColor = (difficulty) => {
-    if (difficulty <= 2) return 'bg-teal-600 hover:bg-teal-500'; // Very Easy
-    if (difficulty === 3) return 'bg-slate-500 hover:bg-slate-400'; // Neutral
-    if (difficulty === 4) return 'bg-rose-600 hover:bg-rose-500'; // Hard
-    if (difficulty >= 5) return 'bg-red-800 hover:bg-red-700';   // Very Hard
+    if (difficulty <= 2) return 'bg-teal-600 hover:bg-teal-500';
+    if (difficulty === 3) return 'bg-slate-500 hover:bg-slate-400';
+    if (difficulty === 4) return 'bg-rose-600 hover:bg-rose-500';
+    if (difficulty >= 5) return 'bg-red-800 hover:bg-red-700';
     return 'bg-gray-400';
   };
 
@@ -41,12 +81,15 @@ const FixturesPage = () => {
       <div className="max-w-4xl mx-auto">
         <h1 className="text-3xl font-bold mb-2 text-emerald-400">Fixture Difficulty</h1>
         <p className="text-slate-400 mb-8">
-          Teams are ranked by their average fixture difficulty over the next 5 gameweeks. A lower average score indicates an easier schedule.
+          Teams are ranked by their average fixture difficulty over the next 5 gameweeks.
         </p>
         
         {loading && (
-          <div className="flex justify-center items-center h-64">
-            <Loader2 className="w-12 h-12 animate-spin text-emerald-400" />
+          <div className="flex justify-center items-center h-64 text-center">
+            <div>
+              <Loader2 className="w-12 h-12 animate-spin text-emerald-400 mx-auto" />
+              <p className="mt-4 text-slate-400">{statusMessage}</p>
+            </div>
           </div>
         )}
 
@@ -56,16 +99,14 @@ const FixturesPage = () => {
           <div className="space-y-3">
             {fixturesData.map((team) => (
               <div key={team.name} className="bg-slate-800/70 p-4 rounded-lg flex flex-col sm:flex-row items-start sm:items-center justify-between transition-all hover:bg-slate-800 border border-slate-700">
-                {/* Team Name and Average Difficulty */}
                 <div className="flex items-center mb-4 sm:mb-0 sm:w-1/3">
                   <span className="font-bold text-lg w-40 truncate" title={team.name}>{team.name}</span>
                   <span className="text-xs font-mono bg-slate-700 text-slate-300 px-2 py-1 rounded-md">
                     Avg: {team.avg_difficulty}
                   </span>
                 </div>
-                {/* Individual Fixture Blocks */}
                 <div className="flex flex-wrap gap-2">
-                  {team.fixture_details && team.fixture_details.map((fixture, index) => (
+                  {team.fixture_details?.map((fixture, index) => (
                     <div 
                       key={index} 
                       className={`flex flex-col items-center justify-center p-2 rounded-md w-20 h-14 text-white text-center shadow-md transition-transform hover:scale-105 ${getDifficultyColor(fixture.difficulty)}`}

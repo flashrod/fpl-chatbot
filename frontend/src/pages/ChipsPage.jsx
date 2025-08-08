@@ -5,16 +5,29 @@ const ChipsPage = () => {
   const [chipData, setChipData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [statusMessage, setStatusMessage] = useState('Connecting to server...');
 
   useEffect(() => {
-    const fetchChipData = async () => {
-      setLoading(true);
-      setError('');
+    const API_BASE_URL = 'https://fpl-chatbot-4zm5.onrender.com'; // Use your deployed URL
+
+    const checkServerStatus = async () => {
       try {
-        const response = await fetch('https://fpl-chatbot-4zm5.onrender.com/api/chip-recommendations');
-        if (!response.ok) {
-          throw new Error('Failed to fetch chip recommendations.');
-        }
+        const response = await fetch(`${API_BASE_URL}/api/status`);
+        if (!response.ok) throw new Error('Server not responding.');
+        const data = await response.json();
+        if (data.players_in_master_df > 0) return true;
+        setStatusMessage('Server is starting up, loading data...');
+        return false;
+      } catch (err) {
+        setStatusMessage('Could not connect to the server. It might be starting up.');
+        return false;
+      }
+    };
+
+    const fetchChipData = async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/chip-recommendations`);
+        if (!response.ok) throw new Error('Failed to fetch chip recommendations.');
         const data = await response.json();
         setChipData(data);
       } catch (err) {
@@ -24,7 +37,28 @@ const ChipsPage = () => {
       }
     };
 
-    fetchChipData();
+    const startFetching = async () => {
+      setLoading(true);
+      setError('');
+      
+      const isReady = await checkServerStatus();
+      if (isReady) {
+        setStatusMessage('Fetching chip recommendations...');
+        fetchChipData();
+      } else {
+        const interval = setInterval(async () => {
+          const ready = await checkServerStatus();
+          if (ready) {
+            clearInterval(interval);
+            setStatusMessage('Fetching chip recommendations...');
+            fetchChipData();
+          }
+        }, 3000);
+        return () => clearInterval(interval);
+      }
+    };
+
+    startFetching();
   }, []);
 
   const ChipCard = ({ title, recommendations, icon }) => (
@@ -57,12 +91,15 @@ const ChipsPage = () => {
     <div className="p-4 md:p-8 bg-slate-800 h-full text-white overflow-y-auto">
       <h1 className="text-3xl font-bold mb-6">AI Chip Strategy</h1>
       <p className="text-slate-400 mb-8">
-        Our AI analyzes all upcoming fixtures to find the most opportune moments to use your powerful chips, focusing on Double Gameweeks and fixture swings.
+        Our AI analyzes all upcoming fixtures to find the most opportune moments to use your powerful chips.
       </p>
       
       {loading && (
-        <div className="flex justify-center items-center h-64">
-          <Loader2 className="w-12 h-12 animate-spin text-green-400" />
+        <div className="flex justify-center items-center h-64 text-center">
+            <div>
+              <Loader2 className="w-12 h-12 animate-spin text-green-400 mx-auto" />
+              <p className="mt-4 text-slate-400">{statusMessage}</p>
+            </div>
         </div>
       )}
 
