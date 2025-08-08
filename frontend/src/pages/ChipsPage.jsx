@@ -11,7 +11,7 @@ const ChipsPage = () => {
       setLoading(true);
       setError('');
       try {
-        const response = await fetch('http://127.0.0.1:8000/api/chip-recommendations');
+        const response = await fetch('https://fpl-chatbot-4zm5.onrender.com/api/chip-recommendations');
         if (!response.ok) {
           throw new Error('Failed to fetch chip recommendations.');
         }

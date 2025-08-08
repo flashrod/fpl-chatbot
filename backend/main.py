@@ -202,9 +202,10 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame, full
     if 'simple_name' not in all_players_df.columns:
         all_players_df['simple_name'] = all_players_df.index.str.lower().str.replace(r'[^a-z0-9\s]', '', regex=True)
 
+    # Check if any part of the player's simple name is in the cleaned question
     for name, player_data in all_players_df.iterrows():
         name_parts = player_data['simple_name'].split()
-        if any(part in cleaned_question for part in name_parts):
+        if any(part in cleaned_question for part in name_parts if len(part) > 2): # Avoid short common words
             player_names_found.append(name)
 
     if player_names_found:
@@ -231,8 +232,9 @@ async def stream_chat_response(request: ChatRequest):
             role = "model" if h.role == "bot" else "user"
             gemini_history.append({"role": role, "parts": [{"text": h.text}]})
 
-        # FIX: Use a more robust substring check for keywords
         if any(keyword in question_lower for keyword in draft_keywords):
+            gemini_history = [] 
+            
             engine = DraftEngine(master_fpl_data)
             draft_df = engine.create_draft()
             

@@ -16,7 +16,7 @@ const LeaguesPage = ({ teamId, gameweek }) => { // Pass teamId and gameweek as p
       setLoading(true);
       setError('');
       try {
-        const response = await fetch(`http://127.0.0.1:8000/api/live-gameweek-data/${teamId}/${gameweek}`);
+        const response = await fetch(`https://fpl-chatbot-4zm5.onrender.com/api/live-gameweek-data/${teamId}/${gameweek}`);
         if (!response.ok) {
           const errorData = await response.json();
           throw new Error(errorData.detail || 'Failed to fetch live data.');

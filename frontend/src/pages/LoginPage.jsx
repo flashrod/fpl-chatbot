@@ -18,7 +18,7 @@ const LoginPage = ({ onLogin }) => {
     setError('');
 
     try {
-      const response = await fetch(`http://127.0.0.1:8000/api/get-team-data/${inputId}`);
+      const response = await fetch(`https://fpl-chatbot-4zm5.onrender.com/api/get-team-data/${inputId}`);
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
         throw new Error(errorData.detail || 'Team ID not found or invalid.');
