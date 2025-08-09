@@ -4,7 +4,7 @@ import httpx
 import asyncio
 import pandas as pd
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 import re
 import logging
 from fastapi import FastAPI, HTTPException
@@ -32,6 +32,7 @@ if not GEMINI_API_KEY:
 genai.configure(api_key=GEMINI_API_KEY)
 
 # --- Paths & URLs ---
+FPL_HOME_URL = "https://fantasy.premierleague.com/"
 FPL_API_BOOTSTRAP = "https://fantasy.premierleague.com/api/bootstrap-static/"
 FPL_API_FIXTURES = "https://fantasy.premierleague.com/api/fixtures/"
 FPL_API_TEAM_PICKS = "https://fantasy.premierleague.com/api/entry/{team_id}/event/{gameweek}/picks/"
@@ -52,13 +53,20 @@ API_HEADERS = {
     "Referer": "https://fantasy.premierleague.com/",
     "Origin": "https://fantasy.premierleague.com",
     "X-Requested-With": "XMLHttpRequest",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
+    "Connection": "keep-alive",
 }
 
 # --- In-Memory Stores ---
-master_fpl_data: pd.DataFrame = None
-current_gameweek_id: int = None
+master_fpl_data: Optional[pd.DataFrame] = None
+current_gameweek_id: Optional[int] = None
 is_game_live: bool = False
 scheduler = AsyncIOScheduler()
+
+# persistent in-memory cookies (survive across scheduler refreshes within the process)
+fpl_cookies: Optional[httpx.Cookies] = None
 
 # --- FastAPI App ---
 app = FastAPI(title="FPL AI Chatbot API")
@@ -84,9 +92,10 @@ def read_json_cache(path: Path):
         logging.warning(f"Could not read cache {path}: {e}")
         return None
 
-async def fetch_with_retries(url: str, client: httpx.AsyncClient, max_retries: int = 3, initial_wait: float = 1.0):
+async def fetch_with_retries(url: str, client: httpx.AsyncClient, cookies: Optional[httpx.Cookies] = None, max_retries: int = 3, initial_wait: float = 1.0):
     """
-    Fetch URL with simple exponential backoff and return httpx.Response or raise.
+    Fetch URL with exponential backoff. Pass cookies (if any) to the request.
+    Returns httpx.Response on success or raises after retries.
     """
     attempt = 0
     wait = initial_wait
@@ -94,14 +103,13 @@ async def fetch_with_retries(url: str, client: httpx.AsyncClient, max_retries: i
         attempt += 1
         try:
             logging.info(f"HTTP Request (attempt {attempt}): GET {url}")
-            resp = await client.get(url, timeout=30.0)
-            # If server responds 403 or other 4xx, raise for status to be handled by caller
+            resp = await client.get(url, timeout=30.0, headers=API_HEADERS, cookies=cookies)
             if resp.status_code == 403:
-                # log truncated body for debugging
-                body_preview = resp.text[:500].replace("\n", " ")
+                # Log a short preview of the body for debugging
+                body_preview = (resp.text or "")[:500].replace("\n", " ")
                 logging.warning(f"Received 403 from {url}. Response preview: {body_preview}")
-                # allow retry (maybe server is flaky), but break after retries
-                raise httpx.HTTPStatusError("403", request=resp.request, response=resp)
+                # Raise HTTPStatusError so caller can decide to refresh cookies
+                raise httpx.HTTPStatusError("403 Forbidden", request=resp.request, response=resp)
             resp.raise_for_status()
             return resp
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
@@ -116,35 +124,71 @@ async def fetch_with_retries(url: str, client: httpx.AsyncClient, max_retries: i
 async def load_and_process_all_data():
     """
     Loads bootstrap static + fixtures from FPL API, merges with FBref if available,
-    and builds the master_fpl_data DataFrame. Includes caching fallback.
+    and builds the master_fpl_data DataFrame. Includes cookie handling and caching fallback.
     """
-    global master_fpl_data, current_gameweek_id, is_game_live
+    global master_fpl_data, current_gameweek_id, is_game_live, fpl_cookies
 
     logging.info("🔄 Starting data update process...")
-
     DATA_DIR.mkdir(exist_ok=True)
 
-    # Setup client with headers, http2, redirects allowed; optional proxy
-    client_args = {
-        "headers": API_HEADERS,
+    # client config; try http2 but we'll gracefully degrade if environment lacks h2
+    base_client_args = {
         "timeout": 30.0,
-        "follow_redirects": True,
-        "http2": True
+        "follow_redirects": True
     }
     if FPL_PROXY_URL:
-        client_args["proxies"] = {
-            "all": FPL_PROXY_URL
-        }
+        base_client_args["proxies"] = {"all": FPL_PROXY_URL}
+
+    # We'll attempt to create an AsyncClient with http2=True first, otherwise fallback to HTTP/1.1
+    client = None
+    try:
+        client = httpx.AsyncClient(http2=True, headers=API_HEADERS, **base_client_args)
+        logging.info("Initialized httpx AsyncClient with http2=True")
+    except Exception as e:
+        logging.warning(f"Could not initialize http2 client (h2 might be missing): {e}. Falling back to HTTP/1.1 client.")
+        client = httpx.AsyncClient(http2=False, headers=API_HEADERS, **base_client_args)
 
     try:
-        async with httpx.AsyncClient(**client_args) as client:
-            # fetch both with retries in parallel
-            tasks = [
-                fetch_with_retries(FPL_API_BOOTSTRAP, client),
-                fetch_with_retries(FPL_API_FIXTURES, client)
-            ]
-            bootstrap_res, fixtures_res = await asyncio.gather(*tasks)
+        async with client:
+            # Step 1 — Acquire cookies from homepage if we don't already have them
+            if not fpl_cookies:
+                try:
+                    logging.info("Fetching cookies from FPL homepage...")
+                    home_resp = await client.get(FPL_HOME_URL, timeout=30.0, headers=API_HEADERS)
+                    home_resp.raise_for_status()
+                    fpl_cookies = home_resp.cookies
+                    logging.info(f"Acquired {len(fpl_cookies)} cookies from homepage.")
+                except Exception as e:
+                    logging.warning(f"Failed to fetch homepage cookies: {e}. Proceeding without cookies and will try cached data on failure.")
 
+            # Step 2 — Fetch API endpoints with cookies (if any)
+            try:
+                tasks = [
+                    fetch_with_retries(FPL_API_BOOTSTRAP, client, cookies=fpl_cookies),
+                    fetch_with_retries(FPL_API_FIXTURES, client, cookies=fpl_cookies)
+                ]
+                bootstrap_res, fixtures_res = await asyncio.gather(*tasks)
+            except httpx.HTTPStatusError as e:
+                # If we hit 403, try refreshing cookies once and retry
+                if e.response is not None and e.response.status_code == 403:
+                    logging.warning("403 detected while fetching API data — attempting to refresh cookies and retry once.")
+                    try:
+                        home_resp = await client.get(FPL_HOME_URL, timeout=30.0, headers=API_HEADERS)
+                        home_resp.raise_for_status()
+                        fpl_cookies = home_resp.cookies
+                        logging.info("Refreshed cookies; retrying API requests...")
+                        tasks = [
+                            fetch_with_retries(FPL_API_BOOTSTRAP, client, cookies=fpl_cookies),
+                            fetch_with_retries(FPL_API_FIXTURES, client, cookies=fpl_cookies)
+                        ]
+                        bootstrap_res, fixtures_res = await asyncio.gather(*tasks)
+                    except Exception as e2:
+                        logging.error(f"Retry after cookie refresh failed: {e2}")
+                        raise
+                else:
+                    raise
+
+        # If we get here, we have successful responses
         bootstrap_data = bootstrap_res.json()
         fixtures_data = fixtures_res.json()
 
