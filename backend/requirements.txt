@@ -1,15 +1,14 @@
-# backend/requirements.txt
 fastapi
 uvicorn
 python-dotenv
 google-generativeai
-httpx
+httpx[http2]   # includes HTTP/2 support via h2
 sentence-transformers
 faiss-cpu
 cachetools
 beautifulsoup4
 requests
 pandas
-lxml # pandas.read_html requires this
+lxml  # pandas.read_html requires this
 apscheduler
 thefuzz
