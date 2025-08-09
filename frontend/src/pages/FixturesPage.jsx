@@ -1,36 +1,25 @@
 import React, { useState, useEffect } from 'react';
 import { Loader2 } from 'lucide-react';
+import { useServerStatus } from '../contexts/ServerStatusContext'; // <-- IMPORT HOOK
 
 const FixturesPage = () => {
+  const { isServerReady, statusMessage } = useServerStatus(); // <-- USE CONTEXT
   const [fixturesData, setFixturesData] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [statusMessage, setStatusMessage] = useState('Connecting to server...');
 
   useEffect(() => {
-    const API_BASE_URL = 'https://fpl-chatbot-4zm5.onrender.com'; // Use your deployed URL
-
-    const checkServerStatus = async () => {
-      try {
-        const response = await fetch(`${API_BASE_URL}/api/status`);
-        if (!response.ok) {
-          throw new Error('Server is not responding.');
-        }
-        const data = await response.json();
-        if (data.players_in_master_df > 0) {
-          return true; // Server is ready
-        }
-        setStatusMessage('Server is starting up, loading data...');
-        return false; // Server is not ready yet
-      } catch (err) {
-        setStatusMessage('Could not connect to the server. It might be starting up.');
-        return false;
-      }
-    };
-
     const fetchFixtures = async () => {
+      // Only fetch if the server is ready
+      if (!isServerReady) {
+        setLoading(true); // Keep showing the loading spinner
+        return;
+      }
+      
+      setLoading(true);
+      setError('');
       try {
-        const response = await fetch(`${API_BASE_URL}/api/fixture-difficulty`);
+        const response = await fetch('https://fpl-ai-backend.onrender.com/api/fixture-difficulty');
         if (!response.ok) {
           throw new Error(`Failed to fetch fixture data (Status: ${response.status})`);
         }
@@ -43,30 +32,8 @@ const FixturesPage = () => {
       }
     };
 
-    const startFetching = async () => {
-      setLoading(true);
-      setError('');
-      
-      const isReady = await checkServerStatus();
-      if (isReady) {
-        setStatusMessage('Fetching fixture data...');
-        fetchFixtures();
-      } else {
-        // If not ready, poll every 3 seconds
-        const interval = setInterval(async () => {
-          const ready = await checkServerStatus();
-          if (ready) {
-            clearInterval(interval);
-            setStatusMessage('Fetching fixture data...');
-            fetchFixtures();
-          }
-        }, 3000);
-        return () => clearInterval(interval);
-      }
-    };
-
-    startFetching();
-  }, []);
+    fetchFixtures();
+  }, [isServerReady]); // <-- Re-run this effect when the server becomes ready
 
   const getDifficultyColor = (difficulty) => {
     if (difficulty <= 2) return 'bg-teal-600 hover:bg-teal-500';
