@@ -12,8 +12,8 @@ export const ServerStatusProvider = ({ children }) => {
   const [statusMessage, setStatusMessage] = useState('Connecting to server...');
 
   useEffect(() => {
-    // IMPORTANT: Replace this with your actual deployed backend URL
-    const API_BASE_URL = 'https://fpl-ai-backend.onrender.com';
+    // Use your deployed URL. Make sure it's correct.
+    const API_BASE_URL = 'https://fpl-chatbot-4zm5.onrender.com'; 
 
     const checkStatus = async () => {
       try {
@@ -35,7 +35,6 @@ export const ServerStatusProvider = ({ children }) => {
       }
     };
 
-    // Poll immediately and then every 3 seconds if not ready
     const pollServer = async () => {
         if (await checkStatus()) return;
 
@@ -43,7 +42,7 @@ export const ServerStatusProvider = ({ children }) => {
             if (await checkStatus()) {
                 clearInterval(intervalId);
             }
-        }, 3000);
+        }, 5000); // Poll every 5 seconds
 
         return () => clearInterval(intervalId);
     };

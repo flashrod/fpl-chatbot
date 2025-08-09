@@ -1,33 +1,27 @@
 import React, { useState, useEffect } from 'react';
-import { Loader2, Zap, Shield, Star } from 'lucide-react';
+import { Loader2, Shield, Star } from 'lucide-react';
+import { useServerStatus } from '../contexts/ServerStatusContext';
 
 const ChipsPage = () => {
+  const { isServerReady, statusMessage } = useServerStatus();
   const [chipData, setChipData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [statusMessage, setStatusMessage] = useState('Connecting to server...');
 
   useEffect(() => {
-    const API_BASE_URL = 'https://fpl-chatbot-4zm5.onrender.com'; // Use your deployed URL
-
-    const checkServerStatus = async () => {
-      try {
-        const response = await fetch(`${API_BASE_URL}/api/status`);
-        if (!response.ok) throw new Error('Server not responding.');
-        const data = await response.json();
-        if (data.players_in_master_df > 0) return true;
-        setStatusMessage('Server is starting up, loading data...');
-        return false;
-      } catch (err) {
-        setStatusMessage('Could not connect to the server. It might be starting up.');
-        return false;
-      }
-    };
-
     const fetchChipData = async () => {
+      if (!isServerReady) {
+        setLoading(true);
+        return;
+      }
+
+      setLoading(true);
+      setError('');
       try {
-        const response = await fetch(`${API_BASE_URL}/api/chip-recommendations`);
-        if (!response.ok) throw new Error('Failed to fetch chip recommendations.');
+        const response = await fetch('https://fpl-chatbot-4zm5.onrender.com/api/chip-recommendations');
+        if (!response.ok) {
+          throw new Error('Failed to fetch chip recommendations.');
+        }
         const data = await response.json();
         setChipData(data);
       } catch (err) {
@@ -37,29 +31,8 @@ const ChipsPage = () => {
       }
     };
 
-    const startFetching = async () => {
-      setLoading(true);
-      setError('');
-      
-      const isReady = await checkServerStatus();
-      if (isReady) {
-        setStatusMessage('Fetching chip recommendations...');
-        fetchChipData();
-      } else {
-        const interval = setInterval(async () => {
-          const ready = await checkServerStatus();
-          if (ready) {
-            clearInterval(interval);
-            setStatusMessage('Fetching chip recommendations...');
-            fetchChipData();
-          }
-        }, 3000);
-        return () => clearInterval(interval);
-      }
-    };
-
-    startFetching();
-  }, []);
+    fetchChipData();
+  }, [isServerReady]);
 
   const ChipCard = ({ title, recommendations, icon }) => (
     <div className="bg-slate-900/50 p-6 rounded-lg shadow-lg">

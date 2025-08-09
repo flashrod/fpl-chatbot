@@ -1,43 +1,43 @@
 import React, { useState, useEffect, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Loader2 } from 'lucide-react'; // Using Lucide for consistency
+import { Loader2 } from 'lucide-react';
+import { useServerStatus } from '../contexts/ServerStatusContext';
 
 const ChatPage = ({ teamId }) => {
+  const { isServerReady, statusMessage } = useServerStatus();
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef(null);
 
-  // Set initial welcome message
   useEffect(() => {
     setMessages([
       { role: 'bot', text: `Hi! I'm ready to help with your FPL team (ID: ${teamId}). Ask me anything about your squad.`, error: false }
     ]);
   }, [teamId]);
 
-  // Auto-scrolling is removed as requested.
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
 
   const handleSend = async (e) => {
     e.preventDefault();
-    if (!input.trim() || isLoading) return;
+    if (!input.trim() || isLoading || !isServerReady) return;
 
     const userMessage = { role: 'user', text: input };
-    // Add user message and an empty bot message placeholder
     setMessages(prev => [...prev, userMessage, { role: 'bot', text: '', error: false }]);
     const currentInput = input;
     setInput('');
     setIsLoading(true);
 
     try {
-      // The API call now sends the conversation history
       const response = await fetch('https://fpl-chatbot-4zm5.onrender.com/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           team_id: parseInt(teamId),
           question: currentInput,
-          // Map the state to the format the backend expects for history
           history: messages.map(m => ({ role: m.role, text: m.text })),
         }),
       });
@@ -50,7 +50,6 @@ const ChatPage = ({ teamId }) => {
       const decoder = new TextDecoder();
       let botResponse = '';
 
-      // Streaming the response into the last message
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
@@ -86,8 +85,7 @@ const ChatPage = ({ teamId }) => {
   return (
     <div className="bg-white w-full h-full flex flex-col">
       <main className="flex-1 overflow-y-auto p-4 bg-slate-100">
-        {/* The ref is kept in case you want to add manual scroll buttons later */}
-        <div className="flex flex-col space-y-4" ref={messagesEndRef}>
+        <div className="flex flex-col space-y-4">
           {messages.map((msg, index) => (
             <div
               key={index}
@@ -105,27 +103,33 @@ const ChatPage = ({ teamId }) => {
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>
                   {msg.text}
                 </ReactMarkdown>
-                {/* Show a blinking cursor on the last message while loading */}
                 {isLoading && msg.role === 'bot' && index === messages.length - 1 && <span className="animate-pulse">▍</span>}
               </div>
             </div>
           ))}
+          <div ref={messagesEndRef} />
         </div>
       </main>
 
       <footer className="p-4 bg-white border-t border-slate-200">
+        {!isServerReady && (
+          <div className="text-center text-xs text-slate-500 pb-2 flex items-center justify-center">
+            <Loader2 className="w-4 h-4 animate-spin mr-2" />
+            {statusMessage}
+          </div>
+        )}
         <form onSubmit={handleSend} className="flex items-center space-x-2">
           <input
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="Ask about transfers, players, etc..."
+            placeholder={isServerReady ? "Ask about transfers, players, etc..." : "Please wait for server to connect..."}
             className="flex-1 w-full px-4 py-2 bg-slate-100 border border-slate-300 rounded-full focus:outline-none focus:ring-2 focus:ring-green-500"
-            disabled={isLoading}
+            disabled={isLoading || !isServerReady}
           />
           <button 
             type="submit" 
-            disabled={isLoading || !input.trim()}
+            disabled={isLoading || !input.trim() || !isServerReady}
             className="bg-green-500 hover:bg-green-600 text-black font-bold p-3 rounded-full transition-colors disabled:bg-slate-400 disabled:cursor-not-allowed flex items-center justify-center w-12 h-12"
           >
             {isLoading ? <Loader2 className="w-6 h-6 animate-spin"/> : (
