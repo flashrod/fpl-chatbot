@@ -204,10 +204,49 @@ async def get_live_gameweek_data(team_id: int, gameweek: int):
 
 # --- Context Builder ---
 def build_context_for_question(question: str, all_players_df: pd.DataFrame) -> str:
+    """
+    Analyzes the user's question to build a relevant context string of data
+    for the AI to use when generating a response.
+    """
     if all_players_df is None or 'simple_name' not in all_players_df.columns:
         return ""
 
     question_lower = question.lower()
+    context = ""
+
+    # --- Keyword-based Context Building ---
+
+    # 1. Handle questions about price/cost
+    if any(word in question_lower for word in ["expensive", "cheapest", "cost", "price"]):
+        # Determine sorting order
+        ascending = "cheapest" in question_lower
+        
+        # Filter by position if mentioned
+        pos_df = all_players_df
+        if "defender" in question_lower:
+            pos_df = all_players_df[all_players_df['position'] == 'DEF']
+        elif "midfielder" in question_lower:
+            pos_df = all_players_df[all_players_df['position'] == 'MID']
+        elif "forward" in question_lower:
+            pos_df = all_players_df[all_players_df['position'] == 'FWD']
+
+        sorted_players = pos_df.sort_values(by='now_cost', ascending=ascending).head(5)
+        
+        context += "Top 5 Players by Price:\n"
+        for name, player in sorted_players.iterrows():
+            context += f"- {name} ({player.get('team_name', '')}): £{player.get('now_cost', 0) / 10.0:.1f}m\n"
+        return context
+
+    # 2. Handle questions about top players/form/points
+    if any(word in question_lower for word in ["top", "best", "form", "points"]):
+        sorted_players = all_players_df.sort_values(by='total_points', ascending=False).head(5)
+        context += "Top 5 Players by Total Points:\n"
+        for name, player in sorted_players.iterrows():
+            context += f"- {name} ({player.get('team_name', '')}): {player.get('total_points', 0)} points\n"
+        return context
+        
+    # --- Player Name Matching (Fallback) ---
+    
     cleaned_question = re.sub(r'[^a-z0-9\s]', '', question_lower)
     player_names_found = []
     simple_map = {row['simple_name']: idx for idx, row in all_players_df.iterrows()}
@@ -216,24 +255,25 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame) -> s
         if re.search(r'\b' + re.escape(sname) + r'\b', cleaned_question):
             player_names_found.append(canonical_name)
 
-    if not player_names_found:
-        return ""
-    
-    unique_players = sorted(list(set(player_names_found)))
-    logging.info(f"👨‍💻 Found players in question: {unique_players}")
-    context = "Player Data:\n"
-    for name in unique_players:
-        if name in all_players_df.index:
-            try:
-                player_data = all_players_df.loc[name][[
-                    'team_name', 'position', 'now_cost', 'total_points', 
-                    'goals_scored', 'assists', 'status', 'news'
-                ]].to_dict()
-                context_str = ", ".join(f"{key}: {value}" for key, value in player_data.items() if value and pd.notna(value))
-                context += f"- {name}: {context_str}\n"
-            except Exception as e:
-                logging.warning(f"Could not build context for player {name}: {e}")
-    return context
+    if player_names_found:
+        unique_players = sorted(list(set(player_names_found)))
+        logging.info(f"👨‍💻 Found players in question: {unique_players}")
+        context += "Player Data:\n"
+        for name in unique_players:
+            if name in all_players_df.index:
+                try:
+                    player_data = all_players_df.loc[name][[
+                        'team_name', 'position', 'now_cost', 'total_points', 
+                        'goals_scored', 'assists', 'status', 'news'
+                    ]].to_dict()
+                    context_str = ", ".join(f"{key}: {value}" for key, value in player_data.items() if value and pd.notna(value))
+                    context += f"- {name}: {context_str}\n"
+                except Exception as e:
+                    logging.warning(f"Could not build context for player {name}: {e}")
+        return context
+
+    # If no specific context is built, return empty
+    return ""
 
 # --- Main Chat Endpoint ---
 @app.post("/api/chat")
