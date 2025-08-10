@@ -130,7 +130,10 @@ def shutdown_event():
     logging.info("👋 Scheduler shut down.")
 
 app.add_middleware(CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://fpl-brain.vercel.app", # Your deployed frontend URL
+        "http://localhost:5173"      # Your local development URL
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]

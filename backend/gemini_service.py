@@ -47,7 +47,7 @@ async def get_ai_response_stream(
     {context_block}
     ---\n\nNow, provide your expert analysis based on the user's request."""
 
-    model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=prompt)
+    model = genai.GenerativeModel('gemini-2.0-flash', system_instruction=prompt)
     chat = model.start_chat(history=history)
     
     response_stream = await chat.send_message_async(question, stream=True)
