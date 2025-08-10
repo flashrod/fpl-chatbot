@@ -1,5 +1,3 @@
-# main.py
-
 import os
 import asyncio
 import pandas as pd
@@ -38,7 +36,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- Paths & URLs ---
+# --- Paths ---
 DATA_DIR = Path(__file__).parent / "fpl_data"
 FBREF_STATS_PATH = DATA_DIR / "fbref_player_stats.csv"
 
@@ -54,7 +52,7 @@ app = FastAPI(title="FPL AI Chatbot API")
 # --- Core Data Processing ---
 async def load_and_process_all_data():
     """
-    Loads bootstrap static + fixtures from Supabase, merges with FBref,
+    Loads bootstrap static + fixtures from Supabase, processes them, merges with FBref,
     and builds the master_fpl_data DataFrame.
     """
     global master_fpl_data, current_gameweek_id, is_game_live
@@ -79,21 +77,50 @@ async def load_and_process_all_data():
     current_gameweek_id = next((gw['id'] for gw in bootstrap_data.get('events', []) if gw.get('is_current', False)), 1)
 
     teams_map = {team['id']: team['short_name'] for team in bootstrap_data.get('teams', [])}
-    position_map = {p_type['id']: p_type['singular_name_short'] for p_type in bootstrap_data.get('element_types', [])}
     app.state.full_team_names = {team['short_name']: team['name'] for team in bootstrap_data.get('teams', [])}
+    position_map = {p_type['id']: p_type['singular_name_short'] for p_type in bootstrap_data.get('element_types', [])}
+    
+    # --- Process Raw Fixture Data ---
+    team_fixtures = {team_id: [] for team_id in teams_map.keys()}
+    for fixture in fixtures_data:
+        if fixture.get('event') and fixture['event'] >= current_gameweek_id:
+            team_fixtures[fixture['team_h']].append({
+                'gameweek': fixture['event'],
+                'opponent': teams_map.get(fixture['team_a'], 'N/A'),
+                'difficulty': fixture['team_h_difficulty']
+            })
+            team_fixtures[fixture['team_a']].append({
+                'gameweek': fixture['event'],
+                'opponent': teams_map.get(fixture['team_h'], 'N/A'),
+                'difficulty': fixture['team_a_difficulty']
+            })
 
+    team_difficulty_details = {}
+    for team_id, fixtures in team_fixtures.items():
+        sorted_fixtures = sorted(fixtures, key=lambda x: x['gameweek'])
+        next_5 = sorted_fixtures[:5]
+        avg_difficulty = sum(f['difficulty'] for f in next_5) / len(next_5) if next_5 else 0
+        team_difficulty_details[team_id] = {
+            'fixture_details': sorted_fixtures,
+            'avg_fixture_difficulty': avg_difficulty
+        }
+
+    # --- Build Main DataFrame ---
     fpl_players_df = pd.DataFrame(bootstrap_data.get('elements', [])).rename(columns={'web_name': 'Player'})
     fpl_players_df['team_name'] = fpl_players_df['team'].map(teams_map)
     fpl_players_df['position'] = fpl_players_df['element_type'].map(position_map)
-    
-    # ✅ OPTIMIZATION: Create the 'simple_name' column once here during data loading
     fpl_players_df['simple_name'] = fpl_players_df['Player'].str.lower().str.replace(r'[^a-z0-9\s]', '', regex=True).str.strip()
+    fpl_players_df['form'] = pd.to_numeric(fpl_players_df['form'], errors='coerce').fillna(0)
+    
+    # Add the newly processed fixture data to the DataFrame
+    fpl_players_df['fixture_details'] = fpl_players_df['team'].map(lambda x: team_difficulty_details.get(x, {}).get('fixture_details', []))
+    fpl_players_df['avg_fixture_difficulty'] = fpl_players_df['team'].map(lambda x: team_difficulty_details.get(x, {}).get('avg_fixture_difficulty', 0))
 
+    # --- Merge with FBref (Optional) ---
     if FBREF_STATS_PATH.exists():
         try:
             fbref_df = pd.read_csv(FBREF_STATS_PATH)
             fbref_df['Player_lower'] = fbref_df['Player'].str.lower().str.replace(r'[^a-z0-9\s]', '', regex=True).str.strip()
-            # Use simple_name for merging, as it's already created and cleaned
             merged_df = pd.merge(fpl_players_df, fbref_df, left_on='simple_name', right_on='Player_lower', how='left', suffixes=('', '_fbref'))
             merged_df.drop(columns=['Player_lower'], inplace=True, errors='ignore')
         except Exception as e:
@@ -107,7 +134,7 @@ async def load_and_process_all_data():
     merged_df.set_index('Player', inplace=True)
 
     master_fpl_data = merged_df
-    logging.info("✅ Data update complete from Supabase. players=%s, gameweek=%s, is_live=%s",
+    logging.info("✅ Data update complete. players=%s, gameweek=%s, is_live=%s",
                  len(master_fpl_data), current_gameweek_id, is_game_live)
 
 
@@ -116,7 +143,7 @@ async def load_and_process_all_data():
 async def startup_event():
     DATA_DIR.mkdir(exist_ok=True)
     await load_and_process_all_data()
-    scheduler.add_job(load_and_process_all_data, IntervalTrigger(minutes=5))
+    scheduler.add_job(load_and_process_all_data, IntervalTrigger(minutes=15))
     scheduler.start()
     logging.info("🚀 Server started.")
 
@@ -126,10 +153,7 @@ def shutdown_event():
     logging.info("👋 Scheduler shut down.")
 
 app.add_middleware(CORSMiddleware,
-    allow_origins=[
-        "https://fpl-chatbot.vercel.app",
-        "http://localhost:5173"
-    ],
+    allow_origins=["https://fpl-chatbot.vercel.app", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
@@ -156,7 +180,11 @@ async def get_status():
 async def get_fixture_difficulty_data():
     if master_fpl_data is None:
         raise HTTPException(status_code=503, detail="Data is not yet available.")
-    return chip_service.get_all_team_fixture_difficulty(master_fpl_data)
+    try:
+        return chip_service.get_all_team_fixture_difficulty(master_fpl_data)
+    except Exception as e:
+        logging.error(f"❌ Error in get_fixture_difficulty_data: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to calculate fixture difficulty.")
 
 @app.get("/api/chip-recommendations")
 async def get_chip_recommendations_data():
@@ -181,43 +209,30 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame) -> s
 
     question_lower = question.lower()
     cleaned_question = re.sub(r'[^a-z0-9\s]', '', question_lower)
-
-    # ✅ IMPROVEMENT: More robust player name detection
     player_names_found = []
-    # Create a map from simple name to the canonical name (the DataFrame index)
     simple_map = {row['simple_name']: idx for idx, row in all_players_df.iterrows()}
 
     for sname, canonical_name in simple_map.items():
-        # Use regex with word boundaries to find whole words, preventing partial matches
         if re.search(r'\b' + re.escape(sname) + r'\b', cleaned_question):
             player_names_found.append(canonical_name)
 
     if not player_names_found:
-        return "" # No players found, return empty context
+        return ""
     
-    # De-duplicate the list of found players
     unique_players = sorted(list(set(player_names_found)))
     logging.info(f"👨‍💻 Found players in question: {unique_players}")
-
     context = "Player Data:\n"
     for name in unique_players:
         if name in all_players_df.index:
             try:
-                # Select only the most useful columns for the context
                 player_data = all_players_df.loc[name][[
                     'team_name', 'position', 'now_cost', 'total_points', 
                     'goals_scored', 'assists', 'status', 'news'
                 ]].to_dict()
-                
-                # Clean up the context string
                 context_str = ", ".join(f"{key}: {value}" for key, value in player_data.items() if value and pd.notna(value))
                 context += f"- {name}: {context_str}\n"
-
-            except KeyError:
-                context += f"- {name}: Basic data available.\n"
             except Exception as e:
                 logging.warning(f"Could not build context for player {name}: {e}")
-
     return context
 
 # --- Main Chat Endpoint ---
@@ -232,15 +247,11 @@ async def stream_chat_response(request: ChatRequest):
 
     try:
         gemini_history = request.history
-        
-        # ✅ CRITICAL FIX: Corrected typo from 'contthext_block' to 'context_block'
         context_block = build_context_for_question(request.question, master_fpl_data)
-
         async for chunk in gemini_service.get_ai_response_stream(
             request.question, gemini_history, context_block, is_game_live
         ):
             yield chunk
-
     except Exception as e:
         logging.error(f"Error during chat streaming: {e}", exc_info=True)
         yield "Sorry, I encountered a critical server error. The issue has been logged.\n"
