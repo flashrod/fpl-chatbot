@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { Loader2, ShieldCheck, Swords, Trophy, Users } from 'lucide-react';
+import { Loader2, Rocket } from 'lucide-react';
 
-const LeaguesPage = ({ teamId, gameweek }) => { // Pass teamId and gameweek as props
+const LeaguesPage = ({ teamId, gameweek }) => {
   const [liveData, setLiveData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -31,7 +31,6 @@ const LeaguesPage = ({ teamId, gameweek }) => { // Pass teamId and gameweek as p
     };
 
     fetchLiveData();
-    // Refresh data every 60 seconds
     const interval = setInterval(fetchLiveData, 60000);
     return () => clearInterval(interval);
   }, [teamId, gameweek]);
@@ -58,7 +57,7 @@ const LeaguesPage = ({ teamId, gameweek }) => { // Pass teamId and gameweek as p
       <div className="max-w-6xl mx-auto">
         <div className="flex justify-between items-center mb-6">
           <div>
-            <h1 className="text-3xl font-bold text-emerald-400">Live Gameweek {gameweek}</h1>
+            <h1 className="text-3xl font-bold text-emerald-400">Live Gameweek {gameweek || ''}</h1>
             <p className="text-slate-400">Real-time points and stats for your team.</p>
           </div>
           {liveData && (
@@ -76,13 +75,26 @@ const LeaguesPage = ({ teamId, gameweek }) => { // Pass teamId and gameweek as p
           </div>
         )}
 
-        {error && (
+        {/* --- COMING SOON BLOCK --- */}
+        {error && error.includes('not yet available') && (
+          <div className="text-center p-8 mt-8 bg-slate-800/70 rounded-lg border border-slate-700">
+            <Rocket className="w-16 h-16 mx-auto mb-4 text-emerald-400" />
+            <h2 className="text-2xl font-bold text-white mb-2">Feature Coming Soon!</h2>
+            <p className="text-slate-400 max-w-md mx-auto">
+              Live gameweek tracking is under development. This page will become active once the FPL season begins and live data is available.
+            </p>
+          </div>
+        )}
+
+        {/* --- GENERIC ERROR BLOCK --- */}
+        {error && !error.includes('not yet available') && (
           <div className="text-red-400 text-center p-4 bg-red-900/50 rounded-lg">
             <h3 className="font-bold text-lg">Could not load live data</h3>
             <p>{error}</p>
           </div>
         )}
-
+        
+        {/* --- DATA TABLE --- */}
         {!loading && !error && liveData && (
           <div className="bg-slate-800/70 rounded-lg shadow-lg overflow-hidden border border-slate-700">
             <table className="w-full text-sm">

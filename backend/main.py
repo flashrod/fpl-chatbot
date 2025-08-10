@@ -246,12 +246,25 @@ async def stream_chat_response(request: ChatRequest):
         return
 
     try:
-        gemini_history = request.history
+        # ✅ FIX: Reformat the chat history to match the Gemini API's required structure
+        gemini_history = []
+        for message in request.history:
+            # The AI expects the format: {'role': 'user', 'parts': [{'text': 'Hello'}]}
+            # We are converting from: {'role': 'user', 'text': 'Hello'}
+            if 'text' in message and message['text'] is not None:
+                gemini_history.append({
+                    "role": message["role"],
+                    "parts": [{"text": message["text"]}]
+                })
+
         context_block = build_context_for_question(request.question, master_fpl_data)
+        
+        # Now we pass the correctly formatted `gemini_history`
         async for chunk in gemini_service.get_ai_response_stream(
             request.question, gemini_history, context_block, is_game_live
         ):
             yield chunk
+            
     except Exception as e:
         logging.error(f"Error during chat streaming: {e}", exc_info=True)
         yield "Sorry, I encountered a critical server error. The issue has been logged.\n"
