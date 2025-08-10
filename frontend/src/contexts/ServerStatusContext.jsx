@@ -12,7 +12,7 @@ export const ServerStatusProvider = ({ children }) => {
   const [statusMessage, setStatusMessage] = useState('Connecting to server...');
 
   useEffect(() => {
-    // Use your deployed URL. Make sure it's correct.
+    // Make sure this URL matches your deployed backend
     const API_BASE_URL = 'https://fpl-chatbot-4zm5.onrender.com'; 
 
     const checkStatus = async () => {
