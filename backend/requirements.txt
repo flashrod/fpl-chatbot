@@ -12,3 +12,4 @@ pandas
 lxml  # pandas.read_html requires this
 apscheduler
 thefuzz
+supabase
