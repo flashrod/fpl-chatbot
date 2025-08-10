@@ -131,7 +131,7 @@ def shutdown_event():
 
 app.add_middleware(CORSMiddleware,
     allow_origins=[
-        "https://fpl-brain.vercel.app", # Your deployed frontend URL
+        "https://fpl-chatbot.vercel.app", # Your deployed frontend URL
         "http://localhost:5173"      # Your local development URL
     ],
     allow_credentials=True,
