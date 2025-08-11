@@ -153,7 +153,7 @@ def shutdown_event():
     logging.info("👋 Scheduler shut down.")
 
 app.add_middleware(CORSMiddleware,
-    allow_origins=["https://fpl-chatbot.vercel.app", "http://localhost:5173"],
+    allow_origins=["https://fpl-brain.vercel.app", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
