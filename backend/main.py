@@ -156,13 +156,17 @@ async def get_status():
 
 @app.get("/api/fixture-difficulty")
 async def get_fixture_difficulty_data():
-    if master_fpl_data is None: raise HTTPException(status_code=503, detail="Data is not yet available.")
-    return chip_service.get_all_team_fixture_difficulty(master_fpl_data)
+    if master_fpl_data is None or current_gameweek_id is None:
+        raise HTTPException(status_code=503, detail="Data is not yet available.")
+    # MODIFIED: Called the new function
+    return chip_service.get_fixture_difficulty_for_next_n_gameweeks(master_fpl_data, current_gameweek_id)
 
 @app.get("/api/chip-recommendations")
 async def get_chip_recommendations_data():
-    if master_fpl_data is None: raise HTTPException(status_code=503, detail="Data is not yet available.")
-    return chip_service.calculate_chip_recommendations(master_fpl_data)
+    if master_fpl_data is None or current_gameweek_id is None:
+        raise HTTPException(status_code=503, detail="Data is not yet available.")
+    # MODIFIED: Called the new function
+    return chip_service.calculate_chip_recommendations_new(master_fpl_data, current_gameweek_id)
 
 @app.get("/api/get-team-data/{team_id}")
 async def get_team_data(team_id: int):
