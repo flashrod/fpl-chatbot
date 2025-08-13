@@ -19,6 +19,8 @@ from supabase import create_client, Client
 import chip_service
 import gemini_service
 from draft_service import DraftEngine
+# MODIFIED: Added the new fpl_service import
+import fpl_service 
 
 # --- Configuration & Logging ---
 load_dotenv()
@@ -96,9 +98,9 @@ async def load_and_process_all_data():
     fpl_players_df['simple_name'] = fpl_players_df['Player'].str.lower().str.replace(r'[^a-z0-9\s]', '', regex=True).str.strip()
     fpl_players_df['form'] = pd.to_numeric(fpl_players_df['form'], errors='coerce').fillna(0)
     
-    # This is a critical line for the new context builder. Make sure 'points_per_game' exists.
-    if 'points_per_game' not in fpl_players_df.columns:
-        fpl_players_df['points_per_game'] = pd.to_numeric(fpl_players_df['points_per_game'], errors='coerce').fillna(0)
+    # MODIFIED: This safely handles the 'points_per_game' column.
+    # The FPL API provides this, so we just need to ensure it's a number.
+    fpl_players_df['points_per_game'] = pd.to_numeric(fpl_players_df['points_per_game'], errors='coerce').fillna(0)
 
     fpl_players_df['fixture_details'] = fpl_players_df['team'].map(lambda x: team_difficulty_details.get(x, {}).get('fixture_details', []))
     fpl_players_df['avg_fixture_difficulty'] = fpl_players_df['team'].map(lambda x: team_difficulty_details.get(x, {}).get('avg_fixture_difficulty', 0))
@@ -182,9 +184,35 @@ async def get_live_gameweek_data(team_id: int, gameweek: int):
     raise HTTPException(status_code=404, detail="Live gameweek data feature is not yet available.")
 
 # --- NEW, SMARTER CONTEXT BUILDER ---
-# This entire function is replaced with the new version.
-def build_context_for_question(question: str, all_players_df: pd.DataFrame) -> str:
+def build_context_for_question(question: str, all_players_df: pd.DataFrame, user_team_data: Optional[dict] = None) -> str:
     if all_players_df is None: return ""
+
+    context_parts = []
+    
+    # --- Build "My Team" context if data is available ---
+    if user_team_data and 'picks' in user_team_data:
+        my_team_context = "MY CURRENT TEAM:\n"
+        player_ids = [pick['element'] for pick in user_team_data['picks']]
+        # Use .copy() to avoid SettingWithCopyWarning
+        team_df = all_players_df[all_players_df['id'].isin(player_ids)].copy()
+
+        # Sort the team by position for a cleaner display
+        position_order = ['GKP', 'DEF', 'MID', 'FWD']
+        team_df['position_cat'] = pd.Categorical(team_df['position'], categories=position_order, ordered=True)
+        team_df.sort_values('position_cat', inplace=True)
+        
+        starters = team_df[[pick['is_starting'] for pick in user_team_data['picks']]]
+        bench = team_df[[not pick['is_starting'] for pick in user_team_data['picks']]]
+
+        my_team_context += "--- Starting XI ---\n"
+        for name, player in starters.iterrows():
+            my_team_context += f"- {name} ({player.get('team_name')}, £{player.get('now_cost',0)/10.0:.1f}m)\n"
+        
+        my_team_context += "--- Bench ---\n"
+        for name, player in bench.iterrows():
+            my_team_context += f"- {name} ({player.get('team_name')}, £{player.get('now_cost',0)/10.0:.1f}m)\n"
+        
+        context_parts.append(my_team_context)
 
     question_lower = question.lower()
     
@@ -213,12 +241,12 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame) -> s
         top_candidates = df_filtered.sort_values(by='score', ascending=False).head(5)
 
         if not top_candidates.empty:
-            context = f"Here are the top {len(top_candidates)} transfer candidates matching the user's request (Position: {position or 'Any'}, Budget: £{budget/10.0:.1f}m):\n"
+            transfer_context = f"Here are the top {len(top_candidates)} transfer candidates matching the user's request (Position: {position or 'Any'}, Budget: £{budget/10.0:.1f}m):\n"
             for name, player in top_candidates.iterrows():
                 fixtures = ", ".join([f"{f['opponent']}({'H' if f['is_home'] else 'A'})" for f in player.get('fixture_details', [])])
-                context += f"- **{name}** ({player.get('team_name')}, {player.get('position')}, £{player.get('now_cost',0)/10.0:.1f}m): "
-                context += f"Form: {player.get('form',0)}, ICT: {player.get('ict_index',0)}, Upcoming fixtures: {fixtures}\n"
-            return context
+                transfer_context += f"- **{name}** ({player.get('team_name')}, {player.get('position')}, £{player.get('now_cost',0)/10.0:.1f}m): "
+                transfer_context += f"Form: {player.get('form',0)}, ICT: {player.get('ict_index',0)}, Upcoming fixtures: {fixtures}\n"
+            context_parts.append(transfer_context)
 
     # --- Intent 2: Best Value Search ---
     value_triggers = ['value', 'undervalued', 'value for money', 'points per million']
@@ -226,49 +254,60 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame) -> s
         df_value = all_players_df.copy()
         df_value = df_value[pd.to_numeric(df_value['total_points'], errors='coerce').fillna(0) > 50]
         
-        df_value['points_per_million'] = pd.to_numeric(df_value['total_points']) / (pd.to_numeric(df_value['now_cost']) / 10.0)
-        
-        top_value_players = df_value.sort_values(by='points_per_million', ascending=False).head(10)
-        
-        if not top_value_players.empty:
-            context = "Here are the top 10 best value players based on Points Per Million (and have scored >50 total points):\n"
-            for name, player in top_value_players.iterrows():
-                context += (f"- **{name}** ({player.get('team_name')}, {player.get('position')}, £{player.get('now_cost',0)/10.0:.1f}m): "
-                            f"**{player.get('points_per_million', 0):.2f} Points Per Million** (Total Points: {player.get('total_points',0)})\n")
-            return context
+        if not df_value.empty:
+            df_value['points_per_million'] = pd.to_numeric(df_value['total_points']) / (pd.to_numeric(df_value['now_cost']) / 10.0)
+            top_value_players = df_value.sort_values(by='points_per_million', ascending=False).head(10)
+            
+            if not top_value_players.empty:
+                value_context = "Here are the top 10 best value players based on Points Per Million (and have scored >50 total points):\n"
+                for name, player in top_value_players.iterrows():
+                    value_context += (f"- **{name}** ({player.get('team_name')}, {player.get('position')}, £{player.get('now_cost',0)/10.0:.1f}m): "
+                                      f"**{player.get('points_per_million', 0):.2f} Points Per Million** (Total Points: {player.get('total_points',0)})\n")
+                context_parts.append(value_context)
 
     # --- Intent 3: Specific Player Lookup ---
     player_names_found = []
     cleaned_question = re.sub(r"['’]s\b", "", question_lower)
+    df_for_lookup = all_players_df.reset_index()
 
-    for simple_name, full_name in all_players_df[['simple_name', 'Player']].itertuples(index=False):
+    for _, row in df_for_lookup.iterrows():
+        simple_name = row['simple_name']
+        full_name = row['Player']
         if simple_name in cleaned_question:
             player_names_found.append(full_name)
     
     if player_names_found:
         unique_players = sorted(list(set(player_names_found)))
-        context = "Player Data:\n"
+        player_context = "Player Data:\n"
         for name in unique_players:
             if name in all_players_df.index:
                 player_data = all_players_df.loc[name]
                 fixtures = ", ".join([f"{f['opponent']}({'H' if f['is_home'] else 'A'})" for f in player_data.get('fixture_details', [])])
-                context += f"- **{name}** ({player_data.get('team_name')}, {player.data.get('position')}, £{player_data.get('now_cost',0)/10.0:.1f}m): "
-                context += f"Points: {player_data.get('total_points',0)}, Form: {player_data.get('form',0)}, ICT: {player_data.get('ict_index',0)}, Upcoming fixtures: {fixtures}\n"
-        return context
+                player_context += f"- **{name}** ({player_data.get('team_name')}, {player_data.get('position')}, £{player_data.get('now_cost',0)/10.0:.1f}m): "
+                # MODIFIED: Fixed the typo from player.data.get to player_data.get
+                player_context += f"Points: {player_data.get('total_points',0)}, Form: {player_data.get('form',0)}, ICT: {player_data.get('ict_index',0)}, Upcoming fixtures: {fixtures}\n"
+        context_parts.append(player_context)
 
-    return ""
+    # --- Combine all context parts into one string ---
+    return "\n\n".join(context_parts)
 
 # --- Main Chat Endpoint ---
 @app.post("/api/chat")
 async def chat_with_bot(request: ChatRequest):
     return StreamingResponse(stream_chat_response(request), media_type="text/plain")
 
+# MODIFIED: The entire function is updated to fetch and use the user's team data
 async def stream_chat_response(request: ChatRequest):
     if master_fpl_data is None:
         yield "Sorry, the FPL data is not available. The server might still be initializing. Please try again in a moment.\n"
         return
 
     try:
+        # --- NEW: Fetch user's team data if team_id is provided ---
+        user_team_data = None
+        if request.team_id and current_gameweek_id:
+            user_team_data = await fpl_service.get_user_team(request.team_id, current_gameweek_id)
+
         gemini_history = []
         for message in request.history:
             role = message.get("role", "").lower()
@@ -279,7 +318,8 @@ async def stream_chat_response(request: ChatRequest):
                     "parts": [{"text": text}]
                 })
 
-        context_block = build_context_for_question(request.question, master_fpl_data)
+        # --- MODIFIED: Pass the user's team data to the context builder ---
+        context_block = build_context_for_question(request.question, master_fpl_data, user_team_data)
         
         async for chunk in gemini_service.get_ai_response_stream(
             request.question, gemini_history, context_block, is_game_live
