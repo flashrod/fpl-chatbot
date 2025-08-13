@@ -4,17 +4,21 @@ import remarkGfm from 'remark-gfm';
 import { Loader2 } from 'lucide-react';
 import { useServerStatus } from '../contexts/ServerStatusContext';
 
-const ChatPage = ({ teamId }) => {
-  const { isServerReady, statusMessage } = useServerStatus();
+const ChatPage = () => {
+  // MODIFIED: Get teamId and the new userTeamData directly from the global context
+  const { isServerReady, statusMessage, teamId, userTeamData } = useServerStatus();
+  
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef(null);
 
   useEffect(() => {
-    setMessages([
-      { role: 'bot', text: `Hi! I'm ready to help with your FPL team (ID: ${teamId}). Ask me anything about your squad.`, error: false }
-    ]);
+    if (teamId) {
+      setMessages([
+        { role: 'bot', text: `Hi! I'm ready to help with your FPL team (ID: ${teamId}). Ask me anything about your squad.`, error: false }
+      ]);
+    }
   }, [teamId]);
 
   useEffect(() => {
@@ -32,13 +36,17 @@ const ChatPage = ({ teamId }) => {
     setIsLoading(true);
 
     try {
-      const response = await fetch('https://fpl-chatbot-4zm5.onrender.com/api/chat', {
+      // MODIFIED: Use the flexible environment variable for the API URL
+      const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'https://fpl-chatbot-4zm5.onrender.com/api';
+      const response = await fetch(`${API_BASE_URL}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           team_id: parseInt(teamId),
           question: currentInput,
           history: messages.map(m => ({ role: m.role, text: m.text })),
+          // MODIFIED: Send the fetched userTeamData to the backend for personalized advice
+          user_team_data: userTeamData,
         }),
       });
 

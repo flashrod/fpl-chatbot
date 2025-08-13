@@ -19,8 +19,6 @@ from supabase import create_client, Client
 import chip_service
 import gemini_service
 from draft_service import DraftEngine
-# MODIFIED: Added the new fpl_service import
-import fpl_service 
 
 # --- Configuration & Logging ---
 load_dotenv()
@@ -97,11 +95,7 @@ async def load_and_process_all_data():
     fpl_players_df['position'] = fpl_players_df['element_type'].map(position_map)
     fpl_players_df['simple_name'] = fpl_players_df['Player'].str.lower().str.replace(r'[^a-z0-9\s]', '', regex=True).str.strip()
     fpl_players_df['form'] = pd.to_numeric(fpl_players_df['form'], errors='coerce').fillna(0)
-    
-    # MODIFIED: This safely handles the 'points_per_game' column.
-    # The FPL API provides this, so we just need to ensure it's a number.
     fpl_players_df['points_per_game'] = pd.to_numeric(fpl_players_df['points_per_game'], errors='coerce').fillna(0)
-
     fpl_players_df['fixture_details'] = fpl_players_df['team'].map(lambda x: team_difficulty_details.get(x, {}).get('fixture_details', []))
     fpl_players_df['avg_fixture_difficulty'] = fpl_players_df['team'].map(lambda x: team_difficulty_details.get(x, {}).get('avg_fixture_difficulty', 0))
 
@@ -120,10 +114,8 @@ async def load_and_process_all_data():
 
     merged_df.drop_duplicates(subset=['id'], keep='first', inplace=True)
     merged_df.set_index('Player', inplace=True)
-
     master_fpl_data = merged_df
-    logging.info("✅ Data update complete. players=%s, gameweek=%s, is_live=%s",
-                 len(master_fpl_data), current_gameweek_id, is_game_live)
+    logging.info("✅ Data update complete. players=%s, gameweek=%s, is_live=%s", len(master_fpl_data), current_gameweek_id, is_game_live)
 
 # --- App Lifecycle & Schemas ---
 @app.on_event("startup")
@@ -141,37 +133,29 @@ def shutdown_event():
 
 app.add_middleware(CORSMiddleware,
     allow_origins=["https://fpl-chatbot.vercel.app", "https://fpl-brain.vercel.app", "http://localhost:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
+    allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
 )
 
 class ChatRequest(BaseModel):
-    team_id: int = None
+    team_id: Optional[int] = None
     question: str
     history: List[dict] = Field(default_factory=list)
+    user_team_data: Optional[dict] = None
 
 # --- API Endpoints ---
 @app.get("/api/status")
 async def get_status():
-    if master_fpl_data is None:
-        return {"status": "initializing", "players_in_master_df": 0}
-    return {
-        "status": "ok", "is_game_live": is_game_live,
-        "current_gameweek": current_gameweek_id,
-        "players_in_master_df": len(master_fpl_data) if master_fpl_data is not None else 0
-    }
+    if master_fpl_data is None: return {"status": "initializing", "players_in_master_df": 0}
+    return {"status": "ok", "is_game_live": is_game_live, "current_gameweek": current_gameweek_id, "players_in_master_df": len(master_fpl_data)}
 
 @app.get("/api/fixture-difficulty")
 async def get_fixture_difficulty_data():
-    if master_fpl_data is None or current_gameweek_id is None or teams_data_store is None:
-        raise HTTPException(status_code=503, detail="Data is not yet available.")
+    if master_fpl_data is None or current_gameweek_id is None or teams_data_store is None: raise HTTPException(status_code=503, detail="Data is not yet available.")
     return chip_service.get_adjusted_fixture_difficulty(master_fpl_data, teams_data_store, current_gameweek_id)
 
 @app.get("/api/chip-recommendations")
 async def get_chip_recommendations_data():
-    if master_fpl_data is None or current_gameweek_id is None:
-        raise HTTPException(status_code=503, detail="Data is not yet available.")
+    if master_fpl_data is None or current_gameweek_id is None: raise HTTPException(status_code=503, detail="Data is not yet available.")
     return chip_service.calculate_chip_recommendations_new(master_fpl_data, current_gameweek_id)
 
 @app.get("/api/get-team-data/{team_id}")
@@ -183,40 +167,35 @@ async def get_team_data(team_id: int):
 async def get_live_gameweek_data(team_id: int, gameweek: int):
     raise HTTPException(status_code=404, detail="Live gameweek data feature is not yet available.")
 
-# --- NEW, SMARTER CONTEXT BUILDER ---
+# --- CONTEXT BUILDER ---
 def build_context_for_question(question: str, all_players_df: pd.DataFrame, user_team_data: Optional[dict] = None) -> str:
     if all_players_df is None: return ""
-
     context_parts = []
     
-    # --- Build "My Team" context if data is available ---
     if user_team_data and 'picks' in user_team_data:
         my_team_context = "MY CURRENT TEAM:\n"
         player_ids = [pick['element'] for pick in user_team_data['picks']]
-        # Use .copy() to avoid SettingWithCopyWarning
         team_df = all_players_df[all_players_df['id'].isin(player_ids)].copy()
-
-        # Sort the team by position for a cleaner display
         position_order = ['GKP', 'DEF', 'MID', 'FWD']
         team_df['position_cat'] = pd.Categorical(team_df['position'], categories=position_order, ordered=True)
         team_df.sort_values('position_cat', inplace=True)
         
-        starters = team_df[[pick['is_starting'] for pick in user_team_data['picks']]]
-        bench = team_df[[not pick['is_starting'] for pick in user_team_data['picks']]]
+        starters_mask = [pick['is_starting'] for pick in user_team_data['picks']]
+        # We need to align the mask with the team_df after sorting
+        player_id_to_mask = {pick['element']: pick['is_starting'] for pick in user_team_data['picks']}
+        aligned_mask = [player_id_to_mask[player_id] for player_id in team_df['id']]
+
+        starters = team_df[aligned_mask]
+        bench = team_df[[not s for s in aligned_mask]]
 
         my_team_context += "--- Starting XI ---\n"
-        for name, player in starters.iterrows():
-            my_team_context += f"- {name} ({player.get('team_name')}, £{player.get('now_cost',0)/10.0:.1f}m)\n"
-        
+        for name, player in starters.iterrows(): my_team_context += f"- {name} ({player.get('team_name')}, £{player.get('now_cost',0)/10.0:.1f}m)\n"
         my_team_context += "--- Bench ---\n"
-        for name, player in bench.iterrows():
-            my_team_context += f"- {name} ({player.get('team_name')}, £{player.get('now_cost',0)/10.0:.1f}m)\n"
-        
+        for name, player in bench.iterrows(): my_team_context += f"- {name} ({player.get('team_name')}, £{player.get('now_cost',0)/10.0:.1f}m)\n"
         context_parts.append(my_team_context)
 
     question_lower = question.lower()
     
-    # --- Intent 1: Transfer Search ---
     transfer_triggers = ['buy', 'get', 'transfer in', 'replace', 'replacement for', 'midfielder', 'forward', 'defender', 'goalkeeper']
     budget_match = re.search(r'(under|over|less than|more than|for|at)?[ ]?(\d{1,2}(\.\d{1,2})?)m?', question_lower)
     
@@ -248,7 +227,6 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame, user
                 transfer_context += f"Form: {player.get('form',0)}, ICT: {player.get('ict_index',0)}, Upcoming fixtures: {fixtures}\n"
             context_parts.append(transfer_context)
 
-    # --- Intent 2: Best Value Search ---
     value_triggers = ['value', 'undervalued', 'value for money', 'points per million']
     if any(trigger in question_lower for trigger in value_triggers):
         df_value = all_players_df.copy()
@@ -265,7 +243,6 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame, user
                                       f"**{player.get('points_per_million', 0):.2f} Points Per Million** (Total Points: {player.get('total_points',0)})\n")
                 context_parts.append(value_context)
 
-    # --- Intent 3: Specific Player Lookup ---
     player_names_found = []
     cleaned_question = re.sub(r"['’]s\b", "", question_lower)
     df_for_lookup = all_players_df.reset_index()
@@ -284,11 +261,9 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame, user
                 player_data = all_players_df.loc[name]
                 fixtures = ", ".join([f"{f['opponent']}({'H' if f['is_home'] else 'A'})" for f in player_data.get('fixture_details', [])])
                 player_context += f"- **{name}** ({player_data.get('team_name')}, {player_data.get('position')}, £{player_data.get('now_cost',0)/10.0:.1f}m): "
-                # MODIFIED: Fixed the typo from player.data.get to player_data.get
                 player_context += f"Points: {player_data.get('total_points',0)}, Form: {player_data.get('form',0)}, ICT: {player_data.get('ict_index',0)}, Upcoming fixtures: {fixtures}\n"
         context_parts.append(player_context)
 
-    # --- Combine all context parts into one string ---
     return "\n\n".join(context_parts)
 
 # --- Main Chat Endpoint ---
@@ -296,34 +271,23 @@ def build_context_for_question(question: str, all_players_df: pd.DataFrame, user
 async def chat_with_bot(request: ChatRequest):
     return StreamingResponse(stream_chat_response(request), media_type="text/plain")
 
-# MODIFIED: The entire function is updated to fetch and use the user's team data
 async def stream_chat_response(request: ChatRequest):
     if master_fpl_data is None:
         yield "Sorry, the FPL data is not available. The server might still be initializing. Please try again in a moment.\n"
         return
 
     try:
-        # --- NEW: Fetch user's team data if team_id is provided ---
-        user_team_data = None
-        if request.team_id and current_gameweek_id:
-            user_team_data = await fpl_service.get_user_team(request.team_id, current_gameweek_id)
-
+        user_team_data = request.user_team_data
         gemini_history = []
         for message in request.history:
             role = message.get("role", "").lower()
             text = message.get("text")
             if role in ["user", "assistant", "bot"]:
-                gemini_history.append({
-                    "role": "model" if role != "user" else "user",
-                    "parts": [{"text": text}]
-                })
+                gemini_history.append({"role": "model" if role != "user" else "user", "parts": [{"text": text}]})
 
-        # --- MODIFIED: Pass the user's team data to the context builder ---
         context_block = build_context_for_question(request.question, master_fpl_data, user_team_data)
         
-        async for chunk in gemini_service.get_ai_response_stream(
-            request.question, gemini_history, context_block, is_game_live
-        ):
+        async for chunk in gemini_service.get_ai_response_stream(request.question, gemini_history, context_block, is_game_live):
             yield chunk
             
     except Exception as e:
