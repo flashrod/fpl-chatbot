@@ -43,6 +43,7 @@ FBREF_STATS_PATH = DATA_DIR / "fbref_player_stats.csv"
 # --- In-Memory Stores ---
 master_fpl_data: Optional[pd.DataFrame] = None
 current_gameweek_id: Optional[int] = None
+teams_data_store: Optional[list] = None
 is_game_live: bool = False
 scheduler = AsyncIOScheduler()
 
@@ -51,7 +52,7 @@ app = FastAPI(title="FPL AI Chatbot API")
 
 # --- Core Data Processing ---
 async def load_and_process_all_data():
-    global master_fpl_data, current_gameweek_id, is_game_live
+    global master_fpl_data, current_gameweek_id, is_game_live, teams_data_store
     logging.info("🔄 Starting data update process from Supabase...")
     
     try:
@@ -62,6 +63,7 @@ async def load_and_process_all_data():
             raise ValueError("Required data not found in Supabase. Run the sync script first.")
 
         bootstrap_data = bootstrap_response.data['payload']
+        teams_data_store = bootstrap_data.get('teams', [])
         fixtures_data = fixtures_response.data['payload']
         
     except Exception as e:
@@ -131,8 +133,9 @@ def shutdown_event():
     scheduler.shutdown()
     logging.info("👋 Scheduler shut down.")
 
+# MODIFIED: Added your correct frontend URL to the list of allowed origins
 app.add_middleware(CORSMiddleware,
-    allow_origins=["https://fpl-brain.vercel.app", "http://localhost:5173"],
+    allow_origins=["https://fpl-chatbot.vercel.app", "https://fpl-brain.vercel.app", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
@@ -156,16 +159,14 @@ async def get_status():
 
 @app.get("/api/fixture-difficulty")
 async def get_fixture_difficulty_data():
-    if master_fpl_data is None or current_gameweek_id is None:
+    if master_fpl_data is None or current_gameweek_id is None or teams_data_store is None:
         raise HTTPException(status_code=503, detail="Data is not yet available.")
-    # MODIFIED: Called the new function
-    return chip_service.get_fixture_difficulty_for_next_n_gameweeks(master_fpl_data, current_gameweek_id)
+    return chip_service.get_adjusted_fixture_difficulty(master_fpl_data, teams_data_store, current_gameweek_id)
 
 @app.get("/api/chip-recommendations")
 async def get_chip_recommendations_data():
     if master_fpl_data is None or current_gameweek_id is None:
         raise HTTPException(status_code=503, detail="Data is not yet available.")
-    # MODIFIED: Called the new function
     return chip_service.calculate_chip_recommendations_new(master_fpl_data, current_gameweek_id)
 
 @app.get("/api/get-team-data/{team_id}")
