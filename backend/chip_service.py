@@ -200,7 +200,7 @@ if __name__ == '__main__':
         {'short_name': 'LUT', 'strength_overall_home': 950, 'strength_overall_away': 1000},
     ]
 
-    current_gameweek = 4
+    current_gameweek = 1
 
     print("="*50)
     print("\n--- 1. Simple Fixture Difficulty ---\n")

@@ -96,6 +96,10 @@ async def load_and_process_all_data():
     fpl_players_df['simple_name'] = fpl_players_df['Player'].str.lower().str.replace(r'[^a-z0-9\s]', '', regex=True).str.strip()
     fpl_players_df['form'] = pd.to_numeric(fpl_players_df['form'], errors='coerce').fillna(0)
     
+    # This is a critical line for the new context builder. Make sure 'points_per_game' exists.
+    if 'points_per_game' not in fpl_players_df.columns:
+        fpl_players_df['points_per_game'] = pd.to_numeric(fpl_players_df['points_per_game'], errors='coerce').fillna(0)
+
     fpl_players_df['fixture_details'] = fpl_players_df['team'].map(lambda x: team_difficulty_details.get(x, {}).get('fixture_details', []))
     fpl_players_df['avg_fixture_difficulty'] = fpl_players_df['team'].map(lambda x: team_difficulty_details.get(x, {}).get('avg_fixture_difficulty', 0))
 
@@ -133,7 +137,6 @@ def shutdown_event():
     scheduler.shutdown()
     logging.info("👋 Scheduler shut down.")
 
-# MODIFIED: Added your correct frontend URL to the list of allowed origins
 app.add_middleware(CORSMiddleware,
     allow_origins=["https://fpl-chatbot.vercel.app", "https://fpl-brain.vercel.app", "http://localhost:5173"],
     allow_credentials=True,
@@ -179,74 +182,81 @@ async def get_live_gameweek_data(team_id: int, gameweek: int):
     raise HTTPException(status_code=404, detail="Live gameweek data feature is not yet available.")
 
 # --- NEW, SMARTER CONTEXT BUILDER ---
+# This entire function is replaced with the new version.
 def build_context_for_question(question: str, all_players_df: pd.DataFrame) -> str:
-    if all_players_df is None or 'simple_name' not in all_players_df.columns:
-        return ""
+    if all_players_df is None: return ""
 
     question_lower = question.lower()
     
-    # --- Intent 1: Handle Ranking Queries ---
-    ranking_triggers = ['top', 'most', 'best', 'cheapest', 'worst']
-    if any(word in question_lower for word in ranking_triggers):
-        limit = 5
-        if match := re.search(r'(\d+)', question_lower):
-            limit = int(match.group(1))
+    # --- Intent 1: Transfer Search ---
+    transfer_triggers = ['buy', 'get', 'transfer in', 'replace', 'replacement for', 'midfielder', 'forward', 'defender', 'goalkeeper']
+    budget_match = re.search(r'(under|over|less than|more than|for|at)?[ ]?(\d{1,2}(\.\d{1,2})?)m?', question_lower)
+    
+    if any(trigger in question_lower for trigger in transfer_triggers) and budget_match:
+        budget = float(budget_match.group(2)) * 10 
+        position = ""
+        if 'midfielder' in question_lower: position = 'MID'
+        elif 'forward' in question_lower: position = 'FWD'
+        elif 'defender' in question_lower: position = 'DEF'
+        elif 'goalkeeper' in question_lower: position = 'GKP'
 
-        sort_by, ascending, metric_name = None, False, ""
-        if "expensive" in question_lower:
-            sort_by, ascending, metric_name = 'now_cost', False, "Price"
-        elif "cheapest" in question_lower:
-            sort_by, ascending, metric_name = 'now_cost', True, "Price"
-        elif "points" in question_lower:
-            sort_by, ascending, metric_name = 'total_points', False, "Total Points"
-        elif "form" in question_lower:
-            sort_by, ascending, metric_name = 'form', False, "Form"
-        
-        if sort_by:
-            df_filtered = all_players_df.copy()
-            sorted_players = df_filtered.sort_values(by=sort_by, ascending=ascending).head(limit)
-            context = f"Top {limit} Players by {metric_name}:\n"
-            for name, player in sorted_players.iterrows():
-                value = player.get(sort_by, 0)
-                display_val = f"£{value / 10.0:.1f}m" if sort_by == 'now_cost' else value
-                context += f"- {name} ({player.get('team_name', '')}): {display_val}\n"
+        df_filtered = all_players_df.copy()
+        if position:
+            df_filtered = df_filtered[df_filtered['position'] == position]
+        df_filtered = df_filtered[df_filtered['now_cost'] <= budget]
+
+        df_filtered['score'] = (
+            pd.to_numeric(df_filtered['form'], errors='coerce').fillna(0) * 1.5 +
+            pd.to_numeric(df_filtered['ict_index'], errors='coerce').fillna(0) * 1.0 +
+            pd.to_numeric(df_filtered['points_per_game'], errors='coerce').fillna(0) * 1.2
+        )
+        top_candidates = df_filtered.sort_values(by='score', ascending=False).head(5)
+
+        if not top_candidates.empty:
+            context = f"Here are the top {len(top_candidates)} transfer candidates matching the user's request (Position: {position or 'Any'}, Budget: £{budget/10.0:.1f}m):\n"
+            for name, player in top_candidates.iterrows():
+                fixtures = ", ".join([f"{f['opponent']}({'H' if f['is_home'] else 'A'})" for f in player.get('fixture_details', [])])
+                context += f"- **{name}** ({player.get('team_name')}, {player.get('position')}, £{player.get('now_cost',0)/10.0:.1f}m): "
+                context += f"Form: {player.get('form',0)}, ICT: {player.get('ict_index',0)}, Upcoming fixtures: {fixtures}\n"
             return context
 
-    # --- Intent 2: Handle Player Name Matching ---
-    cleaned_question = re.sub(r'[^a-z0-9\s]', '', question_lower)
+    # --- Intent 2: Best Value Search ---
+    value_triggers = ['value', 'undervalued', 'value for money', 'points per million']
+    if any(trigger in question_lower for trigger in value_triggers):
+        df_value = all_players_df.copy()
+        df_value = df_value[pd.to_numeric(df_value['total_points'], errors='coerce').fillna(0) > 50]
+        
+        df_value['points_per_million'] = pd.to_numeric(df_value['total_points']) / (pd.to_numeric(df_value['now_cost']) / 10.0)
+        
+        top_value_players = df_value.sort_values(by='points_per_million', ascending=False).head(10)
+        
+        if not top_value_players.empty:
+            context = "Here are the top 10 best value players based on Points Per Million (and have scored >50 total points):\n"
+            for name, player in top_value_players.iterrows():
+                context += (f"- **{name}** ({player.get('team_name')}, {player.get('position')}, £{player.get('now_cost',0)/10.0:.1f}m): "
+                            f"**{player.get('points_per_million', 0):.2f} Points Per Million** (Total Points: {player.get('total_points',0)})\n")
+            return context
+
+    # --- Intent 3: Specific Player Lookup ---
     player_names_found = []
+    cleaned_question = re.sub(r"['’]s\b", "", question_lower)
+
+    for simple_name, full_name in all_players_df[['simple_name', 'Player']].itertuples(index=False):
+        if simple_name in cleaned_question:
+            player_names_found.append(full_name)
     
-    # Create a mapping from simple name parts to full names for efficient lookup
-    if not hasattr(app.state, 'player_name_map'):
-        app.state.player_name_map = {}
-        for name, row in all_players_df.iterrows():
-            for part in row['simple_name'].split():
-                if len(part) > 2: # Avoid common short words
-                    if part not in app.state.player_name_map:
-                        app.state.player_name_map[part] = []
-                    app.state.player_name_map[part].append(name)
-
-    # Find players by checking words in the question against the map
-    for word in cleaned_question.split():
-        if word in app.state.player_name_map:
-            player_names_found.extend(app.state.player_name_map[word])
-
     if player_names_found:
         unique_players = sorted(list(set(player_names_found)))
         context = "Player Data:\n"
         for name in unique_players:
             if name in all_players_df.index:
-                try:
-                    player_data = all_players_df.loc[name]
-                    # Format fixtures for readability
-                    fixtures = ", ".join([f"{f['opponent']}({'H' if f['is_home'] else 'A'})" for f in player_data.get('fixture_details', [])])
-                    context += f"- **{name}** ({player_data.get('team_name')}, {player_data.get('position')}, £{player_data.get('now_cost',0)/10.0:.1f}m): "
-                    context += f"Points: {player_data.get('total_points',0)}, Form: {player_data.get('form',0)}, ICT: {player_data.get('ict_index',0)}, Fixtures: {fixtures}\n"
-                except Exception as e:
-                    logging.warning(f"Could not build context for player {name}: {e}")
+                player_data = all_players_df.loc[name]
+                fixtures = ", ".join([f"{f['opponent']}({'H' if f['is_home'] else 'A'})" for f in player_data.get('fixture_details', [])])
+                context += f"- **{name}** ({player_data.get('team_name')}, {player.data.get('position')}, £{player_data.get('now_cost',0)/10.0:.1f}m): "
+                context += f"Points: {player_data.get('total_points',0)}, Form: {player_data.get('form',0)}, ICT: {player_data.get('ict_index',0)}, Upcoming fixtures: {fixtures}\n"
         return context
 
-    return "" # Return empty if no specific intent is matched
+    return ""
 
 # --- Main Chat Endpoint ---
 @app.post("/api/chat")
