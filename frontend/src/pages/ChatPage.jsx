@@ -5,9 +5,7 @@ import { Loader2 } from 'lucide-react';
 import { useServerStatus } from '../contexts/ServerStatusContext';
 
 const ChatPage = () => {
-  // MODIFIED: Get teamId and the new userTeamData directly from the global context
-  const { isServerReady, statusMessage, teamId, userTeamData } = useServerStatus();
-  
+  const { isServerReady, statusMessage, teamId } = useServerStatus();
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -16,7 +14,7 @@ const ChatPage = () => {
   useEffect(() => {
     if (teamId) {
       setMessages([
-        { role: 'bot', text: `Hi! I'm ready to help with your FPL team (ID: ${teamId}). Ask me anything about your squad.`, error: false }
+        { role: 'assistant', text: `Hi! I'm ready to help with your FPL team (ID: ${teamId}). Ask me anything about players, transfers, or value.`, error: false }
       ]);
     }
   }, [teamId]);
@@ -30,28 +28,25 @@ const ChatPage = () => {
     if (!input.trim() || isLoading || !isServerReady) return;
 
     const userMessage = { role: 'user', text: input };
-    setMessages(prev => [...prev, userMessage, { role: 'bot', text: '', error: false }]);
     const currentInput = input;
+    setMessages(prev => [...prev, userMessage, { role: 'assistant', text: '', error: false }]);
     setInput('');
     setIsLoading(true);
 
     try {
-      // MODIFIED: Use the flexible environment variable for the API URL
       const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'https://fpl-chatbot-4zm5.onrender.com/api';
       const response = await fetch(`${API_BASE_URL}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          team_id: parseInt(teamId),
           question: currentInput,
+          // Reverted: Does not send team_id as it's not in the ChatRequest model for this version
           history: messages.map(m => ({ role: m.role, text: m.text })),
-          // MODIFIED: Send the fetched userTeamData to the backend for personalized advice
-          user_team_data: userTeamData,
         }),
       });
 
       if (!response.ok || !response.body) {
-          throw new Error('Failed to get a valid response from the server.');
+        throw new Error('Failed to get a valid response from the server.');
       }
 
       const reader = response.body.getReader();
@@ -67,7 +62,7 @@ const ChatPage = () => {
         setMessages(prev => {
           const newMessages = [...prev];
           const lastMessage = newMessages[newMessages.length - 1];
-          if (lastMessage && lastMessage.role === 'bot') {
+          if (lastMessage && lastMessage.role === 'assistant') {
             lastMessage.text = botResponse;
           }
           return newMessages;
@@ -79,7 +74,7 @@ const ChatPage = () => {
       setMessages(prev => {
          const newMessages = [...prev];
          const lastMessage = newMessages[newMessages.length - 1];
-         if (lastMessage && lastMessage.role === 'bot') {
+         if (lastMessage && lastMessage.role === 'assistant') {
             lastMessage.text = 'Sorry, I had a problem thinking. Please try again.';
             lastMessage.error = true;
          }
@@ -111,7 +106,7 @@ const ChatPage = () => {
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>
                   {msg.text}
                 </ReactMarkdown>
-                {isLoading && msg.role === 'bot' && index === messages.length - 1 && <span className="animate-pulse">▍</span>}
+                {isLoading && msg.role === 'assistant' && index === messages.length - 1 && <span className="animate-pulse">▍</span>}
               </div>
             </div>
           ))}
